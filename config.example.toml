@@ -1,0 +1,107 @@
+# gaztag configuration. Copy to ~/.config/gaztag/config.toml and edit.
+# The tracker token and base URL are read from the environment when present
+# (RED_API_TOKEN, RED_BASE_URL), which take precedence over the values below.
+
+# Tracker origin, no trailing slash. Example: "https://tracker.example"
+base_url = ""
+# API token (Authorization header value). Prefer the RED_API_TOKEN environment
+# variable over storing the token in a file.
+api_token = ""
+
+# Directory Transmission writes ".torrent" / ".torrent.added" files into. The
+# content name of each torrent is matched against source directory names.
+torrent_dir = ""
+
+# Destination root for the organized tree. Empty organizes in place, beside the
+# source directory. May be overridden per-invocation with --dest.
+dest_root = ""
+
+# DSD releases are placed under this subdirectory of dest_root, matching a
+# segregated "00 DSD" tree. Set to "" to place DSD alongside PCM.
+dsd_subdir = "00 DSD"
+
+# --- Rate limiting -----------------------------------------------------------
+requests_per_window = 10
+window_seconds = 10.0
+request_timeout = 30.0
+
+# --- Genre -------------------------------------------------------------------
+# Mapped genres are joined into a single tag value using genre_join. Set
+# genre_join to a TOML null (omit / leave commented) to write separate values.
+genre_join = "; "
+max_genres = 3
+
+# Tracker tag -> display genre. Unlisted tags are Title-Cased with separators
+# converted to spaces. Compound genres that require hyphens or ampersands are
+# listed explicitly.
+[genre_map]
+"singer.songwriter" = "Singer-Songwriter"
+"drum.and.bass" = "Drum & Bass"
+"hip.hop" = "Hip-Hop"
+"trip.hop" = "Trip-Hop"
+"post.rock" = "Post-Rock"
+"post.punk" = "Post-Punk"
+"synth.pop" = "Synth-Pop"
+"dream.pop" = "Dream Pop"
+"nu.disco" = "Nu-Disco"
+"lo.fi" = "Lo-Fi"
+"jazz.fusion" = "Jazz Fusion"
+"rnb" = "R&B"
+
+# Tracker tags never emitted as genres.
+genre_blocklist = [
+    "staff.picks", "vanity.house", "seen.live",
+    "producer", "composer", "vocalist", "guitarist",
+]
+
+# --- Album artist ------------------------------------------------------------
+# Release-type codes treated as various-artists when more than one artist is
+# credited: 3 = Soundtrack, 7 = Compilation.
+va_release_types = [3, 7]
+various_artists_label = "Various Artists"
+artist_join = ", "
+
+# --- Naming ------------------------------------------------------------------
+# file_template fields: {pos} {title} {disc} {track} {ext}
+#   pos is disc*100 + track on multi-disc releases (101, 201, ...), otherwise a
+#   two-digit track number.
+file_template = "{pos} - {title}{ext}"
+
+# album_dir_template fields: {year} {album} {sort_title} {album_artist}
+#   {label} {catno} {sample_rate} {release_type} {version}
+# Empty fields collapse cleanly (stray "[]" / "()" are removed).
+album_dir_template = "({year}) {album} [{sample_rate}]"
+
+# Leading articles to strip for {sort_title}. Left empty so album and directory
+# names remain literal; the library frontend performs article-insensitive sort.
+sort_articles = []
+
+# DSD sample-rate unit in directory names: "MHz" -> "2.8224 MHz",
+# "kHz" -> "2822.4 kHz". PCM is always kHz.
+dsd_sample_rate_unit = "MHz"
+
+# --- Tag writing -------------------------------------------------------------
+# Album-level fields sourced from the tracker. Per-track fields (title, track,
+# disc, artist) are always read from existing tags and never written here.
+write_genre = true
+write_album = true
+write_albumartist = true
+write_date = true
+# releasetype and albumversion are written only when non-empty; an existing
+# value is never blanked.
+write_releasetype = true
+write_albumversion = true
+write_label = false
+write_catalognumber = false
+# A plain WEB/PCM original with no remaster receives a blank albumversion.
+albumversion_blank_plain = true
+
+# --- Artwork -----------------------------------------------------------------
+fetch_cover = true
+fetch_artist_image = true
+cover_filename = "cover.jpg"
+artist_filename = "artist.jpg"
+max_art_px = 2000
+# Order of cover sources. "tracker" uses the group wiki image; "itunes" queries
+# the iTunes Search API by "album artist + album".
+cover_sources = ["tracker", "itunes"]

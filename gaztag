@@ -1,0 +1,1584 @@
+#!/usr/bin/env python3
+"""gaztag: source album metadata from a Gazelle tracker and organize local music.
+
+The tool links an unaltered source directory to the exact tracker torrent by
+matching the directory name against the content name of the ".torrent" files in
+a watch directory. The matched torrent yields an infohash (and, when present, a
+torrent id parsed from the comment field), either of which identifies the exact
+release on the tracker. The tracker response is treated as authoritative for
+album-level fields (album, year, album artist, label, catalogue number, release
+type, edition/version) and for genre and artwork. Per-track fields (title, track
+number, disc number, track artist) are read from the existing curated file tags
+and are not overwritten.
+
+Operation is two-phase. The "plan" phase resolves metadata and writes a JSON
+plan describing every rename, move, tag change, and artwork fetch without
+touching the library. The plan may be hand-edited. The "apply" phase executes a
+plan. The "run" command performs both with an interactive confirmation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import difflib
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
+
+import requests
+
+try:
+    import mutagen
+    import mutagen.id3
+    import mutagen.mp4
+except ModuleNotFoundError:  # pragma: no cover
+    mutagen = None
+
+try:
+    from PIL import Image  # optional; enables jpeg normalization and downscaling
+except ModuleNotFoundError:  # pragma: no cover
+    Image = None
+
+
+AUDIO_EXTENSIONS = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wv", ".ape",
+                    ".aac", ".dsf", ".dff"}
+DSD_EXTENSIONS = {".dsf", ".dff"}
+COVER_SIDECAR_NAMES = {"cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "front.jpg"}
+# Image types eligible to become the album cover, and additional image types
+# (e.g. booklet scans) recognized but never selected as the cover.
+COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+OTHER_IMAGE_EXTENSIONS = {".webp", ".bmp", ".tif", ".tiff", ".gif"}
+IMAGE_EXTENSIONS = COVER_IMAGE_EXTENSIONS | OTHER_IMAGE_EXTENSIONS
+# Filename stems (without extension) treated as an unambiguous cover.
+COVER_NAME_STEMS = {"cover", "front", "folder", "albumart", "album", "artwork"}
+# Documents filed under the album's booklet subdirectory.
+BOOKLET_EXTENSIONS = {".pdf"}
+# Non-audio, non-image, non-booklet payload segregated from the library.
+EXTRA_EXTENSIONS = {".cue", ".log", ".m3u", ".m3u8", ".nfo", ".sfv", ".txt",
+                    ".md5", ".ffp", ".accurip", ".toc", ".url"}
+DISC_DIR_RE = re.compile(r"^(?:disc|disk|cd|vol(?:ume)?)\s*[.\-_]?\s*0*(\d+)\b", re.IGNORECASE)
+LEADING_NUM_RE = re.compile(r"^\s*(\d{1,3})")
+TORRENTID_RE = re.compile(r"torrentid=(\d+)")
+
+# Tracker release-type integer codes mapped to display names.
+RELEASE_TYPE_NAMES = {
+    1: "Album", 3: "Soundtrack", 5: "EP", 6: "Anthology", 7: "Compilation",
+    9: "Single", 11: "Live album", 13: "Remix", 14: "Bootleg", 15: "Interview",
+    16: "Mixtape", 17: "Demo", 18: "Concert Recording", 19: "DJ Mix",
+    21: "Unknown", 1021: "Produced By", 1022: "Composition",
+    1023: "Remixed By", 1024: "Guest Appearance",
+}
+# Release types written as a blank tag (a plain album carries no release type).
+RELEASE_TYPE_BLANK = {1, 21}
+
+
+# --------------------------------------------------------------------------- #
+# Progress output
+# --------------------------------------------------------------------------- #
+
+_PROGRESS = True
+
+
+def log(msg: str) -> None:
+    if _PROGRESS:
+        print(msg, file=sys.stderr)
+
+
+def set_progress(enabled: bool) -> None:
+    global _PROGRESS
+    _PROGRESS = enabled
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+DEFAULT_GENRE_MAP = {
+    "drum.and.bass": "Drum & Bass",
+    "hip.hop": "Hip-Hop",
+    "trip.hop": "Trip-Hop",
+    "singer.songwriter": "Singer-Songwriter",
+    "rnb": "R&B",
+    "idm": "IDM",
+    "edm": "EDM",
+    "uk.garage": "UK Garage",
+    "nu.disco": "Nu-Disco",
+    "synth.pop": "Synth-Pop",
+    "dream.pop": "Dream Pop",
+    "post.rock": "Post-Rock",
+    "post.punk": "Post-Punk",
+    "lo.fi": "Lo-Fi",
+    "future.garage": "Future Garage",
+    "jazz.fusion": "Jazz Fusion",
+}
+
+DEFAULT_GENRE_BLOCKLIST = {
+    "staff.picks", "vanity.house", "seen.live", "producer", "composer",
+    "vocalist", "guitarist",
+}
+
+DEFAULT_VA_RELEASE_TYPES = {3, 7}  # Soundtrack, Compilation
+
+
+@dataclass
+class Config:
+    # Tracker access. base_url is the site origin, e.g. "https://tracker.example".
+    base_url: str = ""
+    api_token: str = ""
+    # This is the directory where your torrent client (or you) store .torrent files
+    # that have been added to your client. Ex. Transmission renames to .torrent.added
+    # and keeps them in the watched directory for auto-add.
+    torrent_dir: str = ""
+
+    # Destination root. Empty writes in place, beside each source directory.
+    dest_root: str = ""
+    # Subdirectory inserted between the destination root and the album-artist
+    # directory for DSD releases. Empty disables the split.
+    dsd_subdir: str = "00 DSD"
+
+    # Rate limiting for tracker ajax calls.
+    requests_per_window: int = 10
+    window_seconds: float = 10.0
+    request_timeout: float = 30.0
+
+    # Genre handling. genre_join collapses the mapped genres into a single tag
+    # value; set to null in TOML to write each genre as a separate value.
+    genre_map: dict = field(default_factory=lambda: dict(DEFAULT_GENRE_MAP))
+    genre_blocklist: set = field(default_factory=lambda: set(DEFAULT_GENRE_BLOCKLIST))
+    max_genres: int = 3
+    genre_join: Optional[str] = "; "
+
+    # Album artist derivation.
+    va_release_types: set = field(default_factory=lambda: set(DEFAULT_VA_RELEASE_TYPES))
+    various_artists_label: str = "Various Artists"
+    artist_join: str = ", "
+
+    # Naming. file_template fields: pos, title, disc, track, ext.
+    #   pos is disc*100+track on multi-disc releases, else the zero-padded track.
+    file_template: str = "{pos} - {title}{ext}"
+    # album_dir_template fields: year, album, sort_title, album_artist, label,
+    # catno, sample_rate, release_type, version.
+    album_dir_template: str = "({year}) {album} [{sample_rate}]"
+    # Leading articles are retained by default (empty list). Frontend sorting is
+    # assumed to handle article-insensitive ordering.
+    sort_articles: tuple = ()
+
+    # Sample-rate rendering. PCM is expressed in kHz. DSD may be expressed in MHz
+    # (e.g. "2.8224 MHz") or kHz (e.g. "2822.4 kHz").
+    dsd_sample_rate_unit: str = "MHz"
+
+    # Tag writing. Genre, album, album artist, and date are written from the
+    # tracker. releasetype and albumversion are written only when non-empty and
+    # never blank an existing value. Per-track fields are never sourced here.
+    write_genre: bool = True
+    write_album: bool = True
+    write_albumartist: bool = True
+    write_date: bool = True
+    write_releasetype: bool = True
+    write_albumversion: bool = True
+    write_label: bool = False
+    write_catalognumber: bool = False
+    # A plain WEB/PCM original with no remaster receives a blank albumversion.
+    albumversion_blank_plain: bool = True
+
+    # Artwork.
+    fetch_cover: bool = True
+    fetch_artist_image: bool = True
+    force_art: bool = False
+    cover_filename: str = "cover.jpg"
+    artist_filename: str = "artist.jpg"
+    max_art_px: int = 2000
+    cover_sources: tuple = ("tracker", "itunes")
+    # Included-artwork handling. An image at least min_cover_px on its shorter
+    # side qualifies as cover art; a qualifying image named like a cover, or the
+    # sole qualifying image, is selected. PNG covers are converted to JPEG when
+    # Pillow is available and conversion is enabled.
+    use_included_cover: bool = True
+    min_cover_px: int = 1000
+    cover_convert_png_to_jpg: bool = True
+    # Leftover-file routing, relative to each source directory's parent (for
+    # unmatched images and extras) or the renamed album directory (for booklets).
+    handle_aux_files: bool = True
+    unmatched_images_dirname: str = "unmatched files"
+    extra_files_dirname: str = ".extraFiles"
+    booklet_dirname: str = "booklet"
+
+    @classmethod
+    def load(cls, path: Optional[str]) -> "Config":
+        cfg = cls()
+        if path:
+            data = _read_toml(Path(path).expanduser())
+            for key, value in data.items():
+                if not hasattr(cfg, key):
+                    print(f"warning: unknown config key '{key}' ignored", file=sys.stderr)
+                    continue
+                current = getattr(cfg, key)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    current.update(value)
+                elif isinstance(current, set) and isinstance(value, list):
+                    setattr(cfg, key, set(value))
+                elif isinstance(current, tuple) and isinstance(value, list):
+                    setattr(cfg, key, tuple(value))
+                else:
+                    setattr(cfg, key, value)
+        cfg.api_token = os.environ.get("RED_API_TOKEN", cfg.api_token)
+        cfg.base_url = os.environ.get("RED_BASE_URL", cfg.base_url).rstrip("/")
+        return cfg
+
+
+def _read_toml(path: Path) -> dict:
+    if not path.exists():
+        raise SystemExit(f"config file not found: {path}")
+    if tomllib is None:  # pragma: no cover
+        raise SystemExit("tomllib unavailable; Python 3.11+ is required for TOML config")
+    with path.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+# --------------------------------------------------------------------------- #
+# Bencode / torrent parsing
+# --------------------------------------------------------------------------- #
+
+class BencodeError(ValueError):
+    pass
+
+
+class _BDecoder:
+    def __init__(self, data: bytes):
+        self.data = data
+        self.pos = 0
+        self.info_span: Optional[tuple[int, int]] = None
+
+    def decode(self) -> Any:
+        return self._value()
+
+    def _value(self) -> Any:
+        c = self.data[self.pos : self.pos + 1]
+        if c == b"i":
+            return self._int()
+        if c == b"l":
+            return self._list()
+        if c == b"d":
+            return self._dict()
+        if c.isdigit():
+            return self._bytes()
+        raise BencodeError(f"unexpected token {c!r} at {self.pos}")
+
+    def _int(self) -> int:
+        end = self.data.index(b"e", self.pos)
+        value = int(self.data[self.pos + 1 : end])
+        self.pos = end + 1
+        return value
+
+    def _bytes(self) -> bytes:
+        colon = self.data.index(b":", self.pos)
+        length = int(self.data[self.pos : colon])
+        start = colon + 1
+        self.pos = start + length
+        return self.data[start : self.pos]
+
+    def _list(self) -> list:
+        self.pos += 1
+        out = []
+        while self.data[self.pos : self.pos + 1] != b"e":
+            out.append(self._value())
+        self.pos += 1
+        return out
+
+    def _dict(self) -> dict:
+        self.pos += 1
+        out: dict = {}
+        while self.data[self.pos : self.pos + 1] != b"e":
+            key = self._bytes()
+            value_start = self.pos
+            value = self._value()
+            if key == b"info":
+                self.info_span = (value_start, self.pos)
+            out[key] = value
+        self.pos += 1
+        return out
+
+
+@dataclass
+class TorrentRef:
+    path: Path
+    name: str
+    infohash: str
+    torrent_id: Optional[int]        # authoritative id parsed from the comment
+    filename_id: Optional[int] = None  # id from the filename; may be truncated
+    audio_sizes: tuple = ()          # sorted sizes of audio payload files
+    audio_names: tuple = ()          # basenames of audio payload files
+
+
+def _torrent_filename_stem(path: Path) -> str:
+    """Return the torrent filename without its .torrent(.added) suffix."""
+    name = path.name
+    for suffix in (".torrent.added", ".torrent"):
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def normalize_release_name(name: str) -> str:
+    """Reduce a release name to a match key.
+
+    A trailing tracker id of the form "-<digits>" (four or more digits, as
+    appended to downloaded torrent filenames such as "... (WEB - FLAC -
+    Lossless)-6353858") is removed. Underscores are converted to spaces to undo
+    the space substitution the tracker applies to torrent filenames, and
+    internal whitespace is collapsed. Album names ending in short volume markers
+    such as "-1" are left intact.
+    """
+    name = unicodedata.normalize("NFC", name).strip()
+    name = re.sub(r"-\d{4,}$", "", name)
+    name = name.replace("_", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def _torrent_audio_files(info: dict) -> list[tuple[str, int]]:
+    """Return (basename, size) for each audio file in a parsed info dictionary.
+
+    Both single-file and multi-file torrents are handled. Non-audio payload such
+    as cover art and logs is excluded so the signature depends only on the audio
+    content.
+    """
+    out: list[tuple[str, int]] = []
+    files = info.get(b"files")
+    if files:
+        for entry in files:
+            path_parts = entry.get(b"path.utf-8") or entry.get(b"path") or []
+            if not path_parts:
+                continue
+            basename = path_parts[-1].decode("utf-8", "replace")
+            if Path(basename).suffix.lower() in AUDIO_EXTENSIONS:
+                out.append((basename, int(entry.get(b"length", 0))))
+    else:
+        name_b = info.get(b"name.utf-8") or info.get(b"name") or b""
+        basename = name_b.decode("utf-8", "replace")
+        if Path(basename).suffix.lower() in AUDIO_EXTENSIONS:
+            out.append((basename, int(info.get(b"length", 0))))
+    return out
+
+
+def parse_torrent(path: Path) -> Optional[TorrentRef]:
+    try:
+        raw = path.read_bytes()
+        decoder = _BDecoder(raw)
+        meta = decoder.decode()
+    except (OSError, BencodeError, ValueError):
+        return None
+    if decoder.info_span is None:
+        return None
+    info_bytes = raw[decoder.info_span[0] : decoder.info_span[1]]
+    infohash = hashlib.sha1(info_bytes).hexdigest().upper()
+    info = meta.get(b"info", {})
+    name_b = info.get(b"name.utf-8") or info.get(b"name")
+    if not name_b:
+        return None
+    name = name_b.decode("utf-8", "replace")
+    torrent_id = None
+    comment = meta.get(b"comment")
+    if comment:
+        m = TORRENTID_RE.search(comment.decode("utf-8", "replace"))
+        if m:
+            torrent_id = int(m.group(1))
+    filename_id = None
+    fm = re.search(r"-(\d{4,})$", _torrent_filename_stem(path))
+    if fm:
+        filename_id = int(fm.group(1))
+    audio = _torrent_audio_files(info)
+    audio_sizes = tuple(sorted(size for _, size in audio))
+    audio_names = tuple(basename for basename, _ in audio)
+    return TorrentRef(path=path, name=name, infohash=infohash, torrent_id=torrent_id,
+                      filename_id=filename_id, audio_sizes=audio_sizes,
+                      audio_names=audio_names)
+
+
+def _dir_audio_sizes(source_dir: Path) -> tuple:
+    sizes = []
+    for p in source_dir.rglob("./*"):
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+            try:
+                sizes.append(p.stat().st_size)
+            except OSError:
+                continue
+    return tuple(sorted(sizes))
+
+
+@dataclass
+class MatchResult:
+    ref: Optional[TorrentRef]
+    method: str = ""
+    suggestion: str = ""
+
+
+class TorrentIndex:
+
+    def __init__(self) -> None:
+        self.refs: list[TorrentRef] = []
+        self._by_name: dict[str, TorrentRef] = {}
+        self._by_norm: dict[str, TorrentRef] = {}
+        self._by_fnorm: dict[str, TorrentRef] = {}
+        self._by_sizes: dict[tuple, TorrentRef] = {}
+
+    def add(self, ref: TorrentRef) -> None:
+        self.refs.append(ref)
+        self._by_name.setdefault(ref.name, ref)
+        self._by_norm.setdefault(normalize_release_name(ref.name), ref)
+        self._by_fnorm.setdefault(normalize_release_name(_torrent_filename_stem(ref.path)), ref)
+        if ref.audio_sizes:
+            self._by_sizes.setdefault(ref.audio_sizes, ref)
+
+    def match(self, source_dir: Path) -> MatchResult:
+        dir_name = source_dir.name
+        if dir_name in self._by_name:
+            return MatchResult(self._by_name[dir_name], "exact name")
+        norm = normalize_release_name(dir_name)
+        if norm in self._by_norm:
+            return MatchResult(self._by_norm[norm], "normalized name")
+        if norm in self._by_fnorm:
+            return MatchResult(self._by_fnorm[norm], "torrent filename")
+
+        dir_sizes = _dir_audio_sizes(source_dir)
+        if dir_sizes:
+            if dir_sizes in self._by_sizes:
+                return MatchResult(self._by_sizes[dir_sizes], "content signature")
+            dir_set = set(dir_sizes)
+            for ref in self.refs:
+                if ref.audio_sizes and set(ref.audio_sizes).issubset(dir_set):
+                    return MatchResult(ref, "content subset")
+
+        matches = difflib.get_close_matches(norm, list(self._by_norm.keys()), n=1, cutoff=0.8)
+        return MatchResult(None, "", matches[0] if matches else "")
+
+
+def build_torrent_index(torrent_dir: Path) -> TorrentIndex:
+    index = TorrentIndex()
+    if not torrent_dir.exists():
+        return index
+    for path in sorted(torrent_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        lower = path.name.lower()
+        if not (lower.endswith(".torrent") or lower.endswith(".torrent.added")):
+            continue
+        ref = parse_torrent(path)
+        if ref is not None:
+            index.add(ref)
+    return index
+
+
+# --------------------------------------------------------------------------- #
+# Tracker API client
+# --------------------------------------------------------------------------- #
+
+class RateLimiter:
+    """Sliding-window limiter permitting a fixed count of events per interval."""
+
+    def __init__(self, limit: int, window: float):
+        self.limit = limit
+        self.window = window
+        self.events: deque[float] = deque()
+
+    def acquire(self) -> None:
+        now = time.monotonic()
+        while self.events and now - self.events[0] >= self.window:
+            self.events.popleft()
+        if len(self.events) >= self.limit:
+            sleep_for = self.window - (now - self.events[0]) + 0.01
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            return self.acquire()
+        self.events.append(time.monotonic())
+
+
+class TrackerError(RuntimeError):
+    pass
+
+
+class AuthError(TrackerError):
+
+
+def normalize_token(token: str) -> str:
+    token = (token or "").strip()
+    m = re.match(r"(?i)^(?:bearer|token)\s+(.*)$", token)
+    if m:
+        token = m.group(1).strip()
+    return token
+
+
+class Tracker:
+    def __init__(self, cfg: Config):
+        token = normalize_token(cfg.api_token)
+        base_url = (cfg.base_url or "").strip().rstrip("/")
+        if not base_url or not token:
+            raise SystemExit(
+                "tracker base_url and api_token must be set. Generate an API key "
+                "in the tracker user settings and provide it via the RED_API_TOKEN "
+                "environment variable or the config file."
+            )
+        self.base_url = base_url
+        self.timeout = cfg.request_timeout
+        self.limiter = RateLimiter(cfg.requests_per_window, cfg.window_seconds)
+        self.session = requests.Session()
+        # Authentication is a single header carrying the bare API key, sent with
+        # every request. This key-only scheme avoids the login/cookie flow and
+        # works for accounts with two-factor authentication enabled.
+        self.session.headers.update({
+            "Authorization": token,
+            "User-Agent": "gaztag/0.2",
+        })
+        self._artist_cache: dict[int, dict] = {}
+        self._identity: Optional[dict] = None
+
+    def _ajax(self, action: str, **params) -> dict:
+        self.limiter.acquire()
+        url = f"{self.base_url}/ajax.php"
+        params = {"action": action, **{k: v for k, v in params.items() if v is not None}}
+        resp = self.session.get(url, params=params, timeout=self.timeout)
+        if resp.status_code in (401, 403):
+            raise AuthError(f"{action}: authentication rejected (HTTP {resp.status_code})")
+        resp.raise_for_status()
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise TrackerError(f"{action}: non-JSON response (HTTP {resp.status_code})")
+        if payload.get("status") != "success":
+            error = payload.get("error", "request failed")
+            if isinstance(error, str) and "auth" in error.lower():
+                raise AuthError(f"{action}: {error}")
+            raise TrackerError(f"{action}: {error}")
+        return payload["response"]
+
+    def whoami(self) -> dict:
+        if self._identity is None:
+            self._identity = self._ajax("index")
+        return self._identity
+
+    def verify(self) -> str:
+        try:
+            ident = self.whoami()
+        except AuthError as exc:
+            raise SystemExit(
+                f"tracker authentication failed: {exc}\n"
+                "Verify the API key (tracker user settings) and, if set, the "
+                "RED_API_TOKEN environment variable."
+            )
+        except (TrackerError, requests.RequestException) as exc:
+            raise SystemExit(f"tracker unreachable during authentication: {exc}")
+        username = ident.get("username", "?")
+        api_version = ident.get("api_version", "?")
+        return f"authenticated as {username} (api {api_version})"
+
+    def torrent_by_hash(self, infohash: str) -> dict:
+        return self._ajax("torrent", hash=infohash.upper())
+
+    def torrent_by_id(self, torrent_id: int) -> dict:
+        return self._ajax("torrent", id=torrent_id)
+
+    def artist(self, artist_id: int) -> dict:
+        if artist_id not in self._artist_cache:
+            self._artist_cache[artist_id] = self._ajax("artist", id=artist_id)
+        return self._artist_cache[artist_id]
+
+
+# --------------------------------------------------------------------------- #
+# Metadata model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class AlbumMeta:
+    album: str
+    year: int
+    album_artist: str
+    artist_id: Optional[int]
+    label: str
+    catalog: str
+    release_type: int
+    release_type_name: str
+    genres: list[str]
+    media: str
+    remastered: bool
+    remaster_year: int
+    remaster_title: str
+    remaster_label: str
+    wiki_image: Optional[str]
+    raw_tags: list[str]
+
+
+def _derive_album_artist(cfg: Config, music_info: dict, release_type: int) -> tuple[str, Optional[int]]:
+    artists = music_info.get("artists") or []
+    if release_type in cfg.va_release_types and len(artists) != 1:
+        return cfg.various_artists_label, None
+    if not artists:
+        return cfg.various_artists_label, None
+    if len(artists) == 1:
+        a = artists[0]
+        return a["name"], a.get("id")
+    names = cfg.artist_join.join(a["name"] for a in artists)
+    return names, artists[0].get("id")
+
+
+def map_genres(cfg: Config, raw_tags: list[str]) -> list[str]:
+    out: list[str] = []
+    for tag in raw_tags:
+        key = tag.strip().lower()
+        if not key or key in cfg.genre_blocklist:
+            continue
+        mapped = cfg.genre_map.get(key)
+        if mapped is None:
+            mapped = " ".join(part.capitalize() for part in re.split(r"[.\s_]+", key))
+        if mapped not in out:
+            out.append(mapped)
+        if len(out) >= cfg.max_genres:
+            break
+    return out
+
+
+def _select_torrent(response: dict) -> dict:
+    if "torrent" in response:
+        return response["torrent"]
+    torrents = response.get("torrents") or [{}]
+    return torrents[0]
+
+
+def build_album_meta(cfg: Config, response: dict) -> AlbumMeta:
+    group = response["group"]
+    torrent = _select_torrent(response)
+    music_info = group.get("musicInfo", {})
+    release_type = int(group.get("releaseType", 0) or 0)
+    album_artist, artist_id = _derive_album_artist(cfg, music_info, release_type)
+    raw_tags = group.get("tags") or []
+    rt_name = "" if release_type in RELEASE_TYPE_BLANK else RELEASE_TYPE_NAMES.get(release_type, "")
+    return AlbumMeta(
+        album=(group.get("name") or "").strip(),
+        year=int(group.get("year") or 0),
+        album_artist=album_artist.strip(),
+        artist_id=artist_id,
+        label=(group.get("recordLabel") or "").strip(),
+        catalog=(group.get("catalogueNumber") or "").strip(),
+        release_type=release_type,
+        release_type_name=rt_name,
+        genres=map_genres(cfg, raw_tags),
+        media=(torrent.get("media") or "").strip(),
+        remastered=bool(torrent.get("remastered")),
+        remaster_year=int(torrent.get("remasterYear") or 0),
+        remaster_title=(torrent.get("remasterTitle") or "").strip(),
+        remaster_label=(torrent.get("remasterRecordLabel") or "").strip(),
+        wiki_image=group.get("wikiImage") or None,
+        raw_tags=list(raw_tags),
+    )
+
+
+def build_albumversion(cfg: Config, meta: AlbumMeta, is_dsd: bool) -> str:
+    """Assemble the edition/version string, e.g. 'SACD DSD (2010 Analog Productions)'."""
+    family = "DSD" if is_dsd else "PCM"
+    if (cfg.albumversion_blank_plain and not is_dsd
+            and meta.media in ("", "WEB") and not meta.remastered):
+        return ""
+    base = " ".join(x for x in (meta.media, family) if x).strip()
+    inner_parts = []
+    if meta.remastered:
+        if meta.remaster_year:
+            inner_parts.append(str(meta.remaster_year))
+        if meta.remaster_label:
+            inner_parts.append(meta.remaster_label)
+        if meta.remaster_title:
+            inner_parts.append(meta.remaster_title)
+    inner = " ".join(inner_parts).strip()
+    return (base + (f" ({inner})" if inner else "")).strip()
+
+
+def resolve_album(tracker: Tracker, ref: TorrentRef) -> dict:
+    # The comment id is authoritative. The infohash is used when it is absent;
+    # the filename id is not used for resolution because it may be truncated.
+    if ref.torrent_id is not None:
+        return tracker.torrent_by_id(ref.torrent_id)
+    return tracker.torrent_by_hash(ref.infohash)
+
+
+# --------------------------------------------------------------------------- #
+# Existing-tag reading and audio properties
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class TrackInfo:
+    src: Path
+    disc: int
+    track: int
+    title: str
+    sample_rate: int
+    is_dsd: bool
+
+
+def _first(value) -> str:
+    if isinstance(value, list):
+        return str(value[0]) if value else ""
+    return str(value) if value is not None else ""
+
+
+def read_track_info(path: Path, disc_hint: Optional[int]) -> TrackInfo:
+    disc = disc_hint or 1
+    track = 0
+    title = path.stem
+    sample_rate = 0
+    is_dsd = path.suffix.lower() in DSD_EXTENSIONS
+    if mutagen is not None:
+        try:
+            audio = mutagen.File(str(path), easy=True)
+        except Exception:
+            audio = None
+        if audio is not None:
+            tags = audio.tags or {}
+            title = _first(tags.get("title")) or title
+            tn = _first(tags.get("tracknumber"))
+            if tn:
+                track = int(re.split(r"[/\s]", tn)[0] or 0)
+            dns = _first(tags.get("discnumber"))
+            if dns and disc_hint is None:
+                disc = int(re.split(r"[/\s]", dns)[0] or 1)
+            info = getattr(audio, "info", None)
+            sample_rate = int(getattr(info, "sample_rate", 0) or 0)
+    if track == 0:
+        raw = LEADING_NUM_RE.match(path.stem)
+        if raw:
+            n = int(raw.group(1))
+            if n >= 100 and disc_hint is None:
+                disc, track = divmod(n, 100)
+            else:
+                track = n % 100 if n >= 100 else n
+    return TrackInfo(src=path, disc=disc, track=track, title=title,
+                     sample_rate=sample_rate, is_dsd=is_dsd)
+
+
+def collect_tracks(source_dir: Path) -> list[TrackInfo]:
+    """Enumerate audio files, flattening disc subdirectories with disc numbering."""
+    tracks: list[TrackInfo] = []
+    for p in sorted(source_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+            tracks.append(read_track_info(p, disc_hint=None))
+
+    disc_dirs = []
+    for child in sorted(source_dir.iterdir()):
+        if child.is_dir():
+            m = DISC_DIR_RE.match(child.name)
+            if m:
+                disc_dirs.append((int(m.group(1)), child))
+    for disc_num, child in disc_dirs:
+        for p in sorted(child.iterdir()):
+            if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+                tracks.append(read_track_info(p, disc_hint=disc_num))
+
+    multidisc = len({t.disc for t in tracks}) > 1 or bool(disc_dirs)
+    if not multidisc:
+        for t in tracks:
+            t.disc = 1
+    return tracks
+
+
+def format_sample_rate(hz: int, is_dsd: bool, dsd_unit: str) -> str:
+    if hz <= 0:
+        return ""
+    if is_dsd and dsd_unit.upper() == "MHZ":
+        s = f"{hz / 1_000_000:.4f}".rstrip("0").rstrip(".")
+        return f"{s} MHz"
+    s = f"{hz / 1000:.1f}".rstrip("0").rstrip(".")
+    return f"{s} kHz"
+
+
+# --------------------------------------------------------------------------- #
+# Filesystem naming
+# --------------------------------------------------------------------------- #
+
+ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize(name: str) -> str:
+    name = unicodedata.normalize("NFC", name)
+    name = ILLEGAL_FS.sub("", name)
+    name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
+    return name or "Untitled"
+
+
+def sort_title(cfg: Config, album: str) -> str:
+    words = album.split()
+    if words and cfg.sort_articles and words[0].lower() in cfg.sort_articles:
+        words = words[1:]
+    return " ".join(words) or album
+
+
+def position_string(disc: int, track: int, multidisc: bool) -> str:
+    if multidisc:
+        return f"{disc}{track:02d}"
+    return f"{track:02d}"
+
+
+def _clean_dir_name(name: str) -> str:
+    # Empty template fields leave stray bracket pairs and double spaces.
+    name = re.sub(r"\[\s*\]", "", name)
+    name = re.sub(r"\(\s*\)", "", name)
+    return sanitize(name)
+
+
+# --------------------------------------------------------------------------- #
+# Artwork
+# --------------------------------------------------------------------------- #
+
+def has_cover_sidecar(directory: Path) -> bool:
+    return any((directory / n).exists() for n in COVER_SIDECAR_NAMES)
+
+
+def _save_image(data: bytes, dest: Path, max_px: int) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if Image is not None:
+        from io import BytesIO
+        img = Image.open(BytesIO(data)).convert("RGB")
+        if max(img.size) > max_px:
+            scale = max_px / max(img.size)
+            img = img.resize((round(img.width * scale), round(img.height * scale)))
+        img.save(dest, format="JPEG", quality=92)
+    else:
+        dest.write_bytes(data)
+
+
+def fetch_url_bytes(session: requests.Session, url: str, timeout: float) -> Optional[bytes]:
+    try:
+        resp = session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+    except requests.RequestException:
+        return None
+
+
+def resolve_cover(cfg: Config, session: requests.Session, meta: AlbumMeta) -> Optional[str]:
+    for source in cfg.cover_sources:
+        if source == "tracker" and meta.wiki_image:
+            return meta.wiki_image
+        if source == "itunes":
+            url = _itunes_cover(session, meta, cfg)
+            if url:
+                return url
+    return None
+
+
+def _itunes_cover(session: requests.Session, meta: AlbumMeta, cfg: Config) -> Optional[str]:
+    term = f"{meta.album_artist} {meta.album}".strip()
+    try:
+        resp = session.get(
+            "https://itunes.apple.com/search",
+            params={"term": term, "entity": "album", "limit": 1},
+            timeout=cfg.request_timeout,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results") or []
+    except (requests.RequestException, ValueError):
+        return None
+    if not results:
+        return None
+    art = results[0].get("artworkUrl100")
+    if not art:
+        return None
+    return re.sub(r"/\d+x\d+bb\.jpg$", f"/{cfg.max_art_px}x{cfg.max_art_px}bb.jpg", art)
+
+
+def image_dimensions(path: Path) -> Optional[tuple[int, int]]:
+    if Image is None:
+        return None
+    try:
+        with Image.open(path) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def _cover_qualifies(path: Path, min_px: int) -> bool:
+    dims = image_dimensions(path)
+    if dims is None:
+        # Dimensions are unavailable without Pillow; fall back to name/count.
+        return True
+    return min(dims) >= min_px
+
+
+@dataclass
+class AuxClassification:
+    cover: Optional[Path] = None
+    other_images: list[Path] = field(default_factory=list)
+    booklets: list[Path] = field(default_factory=list)
+    extras: list[Path] = field(default_factory=list)
+    ambiguous_cover: bool = False
+
+
+def classify_aux_files(cfg: Config, source_dir: Path) -> AuxClassification:
+    """Sort non-audio payload into cover, other images, booklets, and extras.
+
+    The cover is a qualifying image (at least cfg.min_cover_px on its shorter
+    side) that is either named like a cover or is the only qualifying image.
+    When several images qualify and none is named like a cover, selection is
+    ambiguous: no cover is chosen and every image is treated as an other-image.
+    """
+    result = AuxClassification()
+    images: list[Path] = []
+    for p in sorted(source_dir.rglob("*")):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in AUDIO_EXTENSIONS:
+            continue
+        if ext in IMAGE_EXTENSIONS:
+            images.append(p)
+        elif ext in BOOKLET_EXTENSIONS:
+            result.booklets.append(p)
+        else:
+            result.extras.append(p)
+
+    eligible = [im for im in images if im.suffix.lower() in COVER_IMAGE_EXTENSIONS]
+    qualifying = [im for im in eligible if _cover_qualifies(im, cfg.min_cover_px)]
+    named = [im for im in qualifying if im.stem.lower() in COVER_NAME_STEMS]
+    cover: Optional[Path] = None
+    if named:
+        cover = named[0]
+    elif len(qualifying) == 1:
+        cover = qualifying[0]
+    elif len(qualifying) > 1:
+        result.ambiguous_cover = True
+
+    result.cover = cover
+    result.other_images = [im for im in images if im != cover]
+    return result
+
+
+def cover_destination(cfg: Config, album_dir: Path, cover: Path) -> tuple[Path, bool]:
+    """Return the cover destination path and whether a PNG->JPEG conversion runs."""
+    convert = (cover.suffix.lower() == ".png" and cfg.cover_convert_png_to_jpg
+               and Image is not None)
+    if cover.suffix.lower() in (".jpg", ".jpeg") or convert:
+        dest_name = cfg.cover_filename  # cover.jpg
+    else:
+        dest_name = str(Path(cfg.cover_filename).with_suffix(cover.suffix.lower()))
+    return album_dir / dest_name, convert
+
+
+# --------------------------------------------------------------------------- #
+# Tag writing (Vorbis comment, ID3, MP4)
+# --------------------------------------------------------------------------- #
+
+# ID3 frame classes keyed by logical field. Custom fields use TXXX descriptors.
+_ID3_TXXX = {"releasetype", "albumversion", "catalognumber"}
+_ID3_FRAMES = {
+    "genre": "TCON", "album": "TALB", "albumartist": "TPE2",
+    "date": "TDRC", "organization": "TPUB", "discnumber": "TPOS",
+    "tracknumber": "TRCK",
+}
+_MP4_ATOMS = {
+    "genre": "\xa9gen", "album": "\xa9alb", "albumartist": "aART", "date": "\xa9day",
+}
+
+
+def _write_vorbis(audio, fields: dict[str, list[str]]) -> None:
+    for key, values in fields.items():
+        audio[key] = values
+
+
+def _write_id3(audio, fields: dict[str, list[str]]) -> None:
+    id3 = audio.tags
+    for key, values in fields.items():
+        text = values if isinstance(values, list) else [values]
+        if key in _ID3_TXXX:
+            id3.delall(f"TXXX:{key.upper()}")
+            id3.add(mutagen.id3.TXXX(encoding=3, desc=key.upper(), text=text))
+        elif key in _ID3_FRAMES:
+            frame_cls = getattr(mutagen.id3, _ID3_FRAMES[key])
+            id3.setall(_ID3_FRAMES[key], [frame_cls(encoding=3, text=text)])
+
+
+def _write_mp4(audio, fields: dict[str, list[str]]) -> None:
+    for key, values in fields.items():
+        if key in ("discnumber", "tracknumber"):
+            atom = "disk" if key == "discnumber" else "trkn"
+            first = values[0] if values else "0"
+            parts = re.split(r"[/\s]+", first)
+            number = int(parts[0] or 0)
+            total = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            audio[atom] = [(number, total)]
+        elif key in _MP4_ATOMS:
+            audio[_MP4_ATOMS[key]] = values
+        else:
+            atom = f"----:com.apple.iTunes:{key.upper()}"
+            audio[atom] = [v.encode("utf-8") for v in values]
+
+
+def apply_tags(path: Path, fields: dict[str, list[str]]) -> None:
+    if mutagen is None or not fields:
+        return
+    try:
+        audio = mutagen.File(str(path))
+    except Exception:
+        return
+    if audio is None:
+        return
+    if audio.tags is None:
+        try:
+            audio.add_tags()
+        except Exception:
+            return
+    if isinstance(audio.tags, mutagen.id3.ID3):
+        _write_id3(audio, fields)
+    elif isinstance(audio, mutagen.mp4.MP4):
+        _write_mp4(audio, fields)
+    else:
+        # Vorbis comment (FLAC, Ogg) and APEv2 behave as case-insensitive maps.
+        _write_vorbis(audio, fields)
+    audio.save()
+
+
+def fields_for_plan(cfg: Config, plan: "AlbumPlan") -> dict[str, list[str]]:
+    fields: dict[str, list[str]] = {}
+    if cfg.write_genre and plan.genres:
+        fields["genre"] = ([cfg.genre_join.join(plan.genres)]
+                           if cfg.genre_join is not None else list(plan.genres))
+    if cfg.write_album and plan.album:
+        fields["album"] = [plan.album]
+    if cfg.write_albumartist and plan.album_artist:
+        fields["albumartist"] = [plan.album_artist]
+    if cfg.write_date and plan.year:
+        fields["date"] = [str(plan.year)]
+    if cfg.write_releasetype and plan.release_type_name:
+        fields["releasetype"] = [plan.release_type_name]
+    if cfg.write_albumversion and plan.albumversion:
+        fields["albumversion"] = [plan.albumversion]
+    if cfg.write_label and plan.label:
+        fields["organization"] = [plan.label]
+    if cfg.write_catalognumber and plan.catalog:
+        fields["catalognumber"] = [plan.catalog]
+    return fields
+
+
+# --------------------------------------------------------------------------- #
+# Plan construction
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class FileOp:
+    src: str
+    dest: str
+    disc: int
+    track: int
+
+
+@dataclass
+class AuxMove:
+    src: str
+    dest: str
+
+
+@dataclass
+class AlbumPlan:
+    source_dir: str
+    matched: bool
+    warnings: list[str] = field(default_factory=list)
+    album: str = ""
+    year: int = 0
+    album_artist: str = ""
+    genres: list[str] = field(default_factory=list)
+    raw_tags: list[str] = field(default_factory=list)
+    release_type_name: str = ""
+    albumversion: str = ""
+    label: str = ""
+    catalog: str = ""
+    media: str = ""
+    sample_rate: str = ""
+    is_dsd: bool = False
+    album_dir: str = ""
+    artist_dir: str = ""
+    files: list[FileOp] = field(default_factory=list)
+    cover_url: Optional[str] = None
+    cover_dest: Optional[str] = None
+    local_cover_src: Optional[str] = None
+    local_cover_convert: bool = False
+    artist_image_url: Optional[str] = None
+    artist_image_dest: Optional[str] = None
+    booklet_files: list[AuxMove] = field(default_factory=list)
+    unmatched_images: list[AuxMove] = field(default_factory=list)
+    extra_files: list[AuxMove] = field(default_factory=list)
+
+
+def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
+                       source_dir: Path) -> AlbumPlan:
+    plan = AlbumPlan(source_dir=str(source_dir), matched=False)
+    log(f"processing: {source_dir.name}")
+    result = index.match(source_dir)
+    ref = result.ref
+    if ref is None:
+        detail = f"; closest torrent: {result.suggestion}" if result.suggestion else ""
+        log(f"  no torrent match{detail}")
+        plan.warnings.append("no matching torrent found for directory name")
+        return plan
+    log(f"  matched torrent [{result.method}]: {ref.name}")
+    lookup = f"id={ref.torrent_id}" if ref.torrent_id is not None else f"infohash {ref.infohash[:12]}"
+    log(f"  querying tracker ({lookup})")
+    try:
+        response = resolve_album(tracker, ref)
+    except (TrackerError, requests.RequestException) as exc:
+        log(f"  tracker lookup failed: {exc}")
+        plan.warnings.append(f"tracker lookup failed: {exc}")
+        return plan
+
+    meta = build_album_meta(cfg, response)
+    log(f"  resolved: {meta.album_artist} - {meta.album} ({meta.year})")
+    if not meta.genres:
+        plan.warnings.append("release carries no usable genre tags")
+
+    tracks = collect_tracks(source_dir)
+    if not tracks:
+        log("  no audio files found")
+        plan.warnings.append("no audio files found in source directory")
+        return plan
+    multidisc = len({t.disc for t in tracks}) > 1
+
+    is_dsd = any(t.is_dsd for t in tracks)
+    rates = [t.sample_rate for t in tracks if t.sample_rate > 0]
+    album_rate = max(rates) if rates else 0
+    sample_rate = format_sample_rate(album_rate, is_dsd, cfg.dsd_sample_rate_unit)
+    if not sample_rate:
+        plan.warnings.append("sample rate could not be determined")
+    descriptors = [f"{len(tracks)} tracks"]
+    if multidisc:
+        descriptors.append("multi-disc")
+    descriptors.append("DSD" if is_dsd else "PCM")
+    descriptors.append(sample_rate or "rate?")
+    log("  " + " | ".join(descriptors))
+    if meta.genres:
+        log(f"  genres: {'; '.join(meta.genres)}")
+
+    albumversion = build_albumversion(cfg, meta, is_dsd)
+    if albumversion:
+        log(f"  version: {albumversion}")
+
+    dest_root = Path(cfg.dest_root).expanduser() if cfg.dest_root else source_dir.parent
+    if is_dsd and cfg.dsd_subdir:
+        dest_root = dest_root / cfg.dsd_subdir
+    artist_dir = dest_root / sanitize(meta.album_artist)
+    album_dir_name = cfg.album_dir_template.format(
+        year=meta.year or "0000",
+        album=sanitize(meta.album),
+        sort_title=sanitize(sort_title(cfg, meta.album)),
+        album_artist=sanitize(meta.album_artist),
+        label=sanitize(meta.label) if meta.label else "",
+        catno=sanitize(meta.catalog) if meta.catalog else "",
+        sample_rate=sample_rate,
+        release_type=meta.release_type_name,
+        version=albumversion,
+    )
+    album_dir = artist_dir / _clean_dir_name(album_dir_name)
+
+    plan.matched = True
+    plan.album = meta.album
+    plan.year = meta.year
+    plan.album_artist = meta.album_artist
+    plan.genres = meta.genres
+    plan.raw_tags = meta.raw_tags
+    plan.release_type_name = meta.release_type_name
+    plan.albumversion = albumversion
+    plan.label = meta.label
+    plan.catalog = meta.catalog
+    plan.media = meta.media
+    plan.sample_rate = sample_rate
+    plan.is_dsd = is_dsd
+    plan.album_dir = str(album_dir)
+    plan.artist_dir = str(artist_dir)
+
+    seen_dests: set[str] = set()
+    for t in sorted(tracks, key=lambda x: (x.disc, x.track, x.src.name)):
+        pos = position_string(t.disc, t.track, multidisc)
+        new_name = sanitize(cfg.file_template.format(
+            pos=pos, title=t.title, disc=t.disc, track=t.track, ext=t.src.suffix.lower()
+        ))
+        dest = album_dir / new_name
+        if str(dest) in seen_dests:
+            plan.warnings.append(f"duplicate destination name: {new_name}")
+        seen_dests.add(str(dest))
+        plan.files.append(FileOp(src=str(t.src), dest=str(dest), disc=t.disc,
+                                 track=t.track))
+
+    # Included artwork and other leftover payload.
+    aux = classify_aux_files(cfg, source_dir) if cfg.handle_aux_files else AuxClassification()
+    unmatched_root = source_dir.parent / cfg.unmatched_images_dirname / source_dir.name
+    extras_root = source_dir.parent / cfg.extra_files_dirname / source_dir.name
+    booklet_root = album_dir / cfg.booklet_dirname
+
+    cover_chosen = False
+    if cfg.use_included_cover and aux.cover is not None:
+        dest, convert = cover_destination(cfg, album_dir, aux.cover)
+        plan.local_cover_src = str(aux.cover)
+        plan.local_cover_convert = convert
+        plan.cover_dest = str(dest)
+        cover_chosen = True
+        log(f"  cover: included ({aux.cover.name}{' -> jpg' if convert else ''})")
+
+    if not cover_chosen and cfg.fetch_cover and (cfg.force_art or not has_cover_sidecar(album_dir)):
+        url = resolve_cover(cfg, tracker.session, meta)
+        if url:
+            plan.cover_url = url
+            plan.cover_dest = str(album_dir / cfg.cover_filename)
+            log("  cover: fetched from " + ("tracker/itunes"))
+        else:
+            log("  cover: not found")
+            plan.warnings.append("cover art could not be resolved")
+
+    for img in aux.other_images:
+        plan.unmatched_images.append(AuxMove(str(img), str(unmatched_root / img.name)))
+    for doc in aux.booklets:
+        plan.booklet_files.append(AuxMove(str(doc), str(booklet_root / doc.name)))
+    for extra in aux.extras:
+        plan.extra_files.append(AuxMove(str(extra), str(extras_root / extra.name)))
+    if aux.ambiguous_cover:
+        log(f"  cover: ambiguous; {len(aux.other_images)} images -> unmatched files")
+    aux_counts = []
+    if plan.booklet_files:
+        aux_counts.append(f"{len(plan.booklet_files)} booklet")
+    if plan.unmatched_images:
+        aux_counts.append(f"{len(plan.unmatched_images)} image")
+    if plan.extra_files:
+        aux_counts.append(f"{len(plan.extra_files)} extra")
+    if aux_counts:
+        log("  aux: " + ", ".join(aux_counts))
+
+    if cfg.fetch_artist_image and meta.artist_id:
+        try:
+            image = tracker.artist(meta.artist_id).get("image")
+        except (TrackerError, requests.RequestException) as exc:
+            image = None
+            plan.warnings.append(f"artist lookup failed: {exc}")
+        artist_dest = artist_dir / cfg.artist_filename
+        if image and (cfg.force_art or not artist_dest.exists()):
+            plan.artist_image_url = image
+            plan.artist_image_dest = str(artist_dest)
+            log("  artist image: resolved")
+
+    log(f"  planned {len(plan.files)} file operations -> {album_dir}")
+    return plan
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+
+def print_report(plans: list[AlbumPlan]) -> None:
+    for plan in plans:
+        print("=" * 72)
+        print(f"SOURCE : {Path(plan.source_dir).name}")
+        if not plan.matched:
+            print("STATUS : UNMATCHED")
+            for w in plan.warnings:
+                print(f"  ! {w}")
+            continue
+        print(f"ALBUM  : {plan.album} ({plan.year})   [{plan.sample_rate or '?'}]")
+        print(f"ARTIST : {plan.album_artist}")
+        print(f"GENRES : {'; '.join(plan.genres) or '(none)'}")
+        print(f"  raw tracker tags: {', '.join(plan.raw_tags) or '(none)'}")
+        if plan.release_type_name:
+            print(f"RELEASE: {plan.release_type_name}")
+        if plan.albumversion:
+            print(f"VERSION: {plan.albumversion}")
+        print(f"DEST   : {plan.album_dir}")
+        for f in plan.files:
+            print(f"  {Path(f.src).name}  ->  {Path(f.dest).name}")
+        if plan.local_cover_src:
+            suffix = " (convert to jpg)" if plan.local_cover_convert else ""
+            print(f"COVER  : included {Path(plan.local_cover_src).name}{suffix}")
+        elif plan.cover_dest:
+            print(f"COVER  : {plan.cover_url}")
+        if plan.booklet_files:
+            booklet_dir = Path(plan.booklet_files[0].dest).parent
+            print(f"BOOKLET: {len(plan.booklet_files)} -> {booklet_dir}")
+        for m in plan.unmatched_images:
+            print(f"  image (unmatched) {Path(m.src).name} -> {m.dest}")
+        for m in plan.extra_files:
+            print(f"  extra {Path(m.src).name} -> {m.dest}")
+        if plan.artist_image_dest:
+            print(f"ARTIST IMG: {plan.artist_image_url}")
+        for w in plan.warnings:
+            print(f"  ! {w}")
+    print("=" * 72)
+
+
+# --------------------------------------------------------------------------- #
+# Plan serialization
+# --------------------------------------------------------------------------- #
+
+def plan_to_dict(plans: list[AlbumPlan]) -> dict:
+    return {"albums": [dataclasses.asdict(p) for p in plans]}
+
+
+def dict_to_plans(data: dict) -> list[AlbumPlan]:
+    plans = []
+    for entry in data.get("albums", []):
+        files = [FileOp(**f) for f in entry.pop("files", [])]
+        booklets = [AuxMove(**m) for m in entry.pop("booklet_files", [])]
+        unmatched = [AuxMove(**m) for m in entry.pop("unmatched_images", [])]
+        extras = [AuxMove(**m) for m in entry.pop("extra_files", [])]
+        plan = AlbumPlan(**entry)
+        plan.files = files
+        plan.booklet_files = booklets
+        plan.unmatched_images = unmatched
+        plan.extra_files = extras
+        plans.append(plan)
+    return plans
+
+
+def write_plan(plans: list[AlbumPlan], path: Path) -> None:
+    path.write_text(json.dumps(plan_to_dict(plans), indent=2, ensure_ascii=False))
+
+
+def load_plan(path: Path) -> list[AlbumPlan]:
+    return dict_to_plans(json.loads(path.read_text()))
+
+
+# --------------------------------------------------------------------------- #
+# Apply
+# --------------------------------------------------------------------------- #
+
+def apply_plan(cfg: Config, plans: list[AlbumPlan], tracker: Optional[Tracker],
+               dry_run: bool = False) -> None:
+    session = tracker.session if tracker is not None else requests.Session()
+    for plan in plans:
+        if not plan.matched:
+            continue
+        album_dir = Path(plan.album_dir)
+        if not dry_run:
+            album_dir.mkdir(parents=True, exist_ok=True)
+        fields = fields_for_plan(cfg, plan)
+        moved_from: set[Path] = set()
+        for f in plan.files:
+            src, dest = Path(f.src), Path(f.dest)
+            moved_from.add(src.parent)
+            print(f"move {src.name} -> {dest}")
+            if not dry_run:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dest)
+                # Per-track fields override album-wide fields. The track tag
+                # holds the bare per-disc track number and restarts at 1 on each
+                # disc; disc identity is carried solely by the discnumber tag.
+                # The concatenated <disc><track> form is a filename convention
+                # and is not applied to tags.
+                track_fields = {**fields, "discnumber": [str(f.disc)],
+                                "tracknumber": [str(f.track)]}
+                apply_tags(dest, track_fields)
+
+        if plan.local_cover_src and plan.cover_dest:
+            print(f"cover (included) -> {plan.cover_dest}")
+            if not dry_run:
+                src = Path(plan.local_cover_src)
+                moved_from.add(src.parent)
+                place_local_cover(src, Path(plan.cover_dest), plan.local_cover_convert,
+                                  cfg.max_art_px)
+        elif plan.cover_url and plan.cover_dest:
+            print(f"cover (remote) -> {plan.cover_dest}")
+            if not dry_run:
+                data = fetch_url_bytes(session, plan.cover_url, cfg.request_timeout)
+                if data:
+                    _save_image(data, Path(plan.cover_dest), cfg.max_art_px)
+
+        for move in plan.booklet_files:
+            src, dest = Path(move.src), Path(move.dest)
+            moved_from.add(src.parent)
+            print(f"booklet -> {dest}")
+            if not dry_run:
+                _move_file(src, dest)
+        for move in plan.unmatched_images:
+            src, dest = Path(move.src), Path(move.dest)
+            moved_from.add(src.parent)
+            print(f"unmatched image -> {dest}")
+            if not dry_run:
+                _move_file(src, dest)
+        for move in plan.extra_files:
+            src, dest = Path(move.src), Path(move.dest)
+            moved_from.add(src.parent)
+            print(f"extra -> {dest}")
+            if not dry_run:
+                _move_file(src, dest)
+
+        if plan.artist_image_url and plan.artist_image_dest:
+            print(f"artist image -> {plan.artist_image_dest}")
+            if not dry_run:
+                data = fetch_url_bytes(session, plan.artist_image_url, cfg.request_timeout)
+                if data:
+                    _save_image(data, Path(plan.artist_image_dest), cfg.max_art_px)
+
+        if not dry_run:
+            for d in sorted(moved_from, key=lambda p: len(p.parts), reverse=True):
+                _remove_if_empty(d)
+            _remove_if_empty(Path(plan.source_dir))
+
+
+def _move_file(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dest)
+
+
+def place_local_cover(src: Path, dest: Path, convert: bool, max_px: int) -> None:
+    """Move an included cover into place, optionally converting PNG to JPEG.
+
+    Conversion also downscales to max_px on the longer side. When conversion is
+    disabled or unavailable the file is moved unchanged.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if convert and Image is not None:
+        try:
+            with Image.open(src) as img:
+                img = img.convert("RGB")
+                if max(img.size) > max_px:
+                    scale = max_px / max(img.size)
+                    img = img.resize((round(img.width * scale), round(img.height * scale)))
+                img.save(dest, format="JPEG", quality=92)
+            src.unlink()
+            return
+        except Exception:
+            pass  # fall back to a plain move on any imaging failure
+    os.replace(src, dest)
+
+
+def _remove_if_empty(directory: Path) -> None:
+    try:
+        if directory.exists() and directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def _iter_source_dirs(paths: list[str], skip_names: frozenset[str] = frozenset()) -> list[Path]:
+    out = []
+    for p in paths:
+        path = Path(p).expanduser()
+        if not path.is_dir():
+            print(f"warning: not a directory: {path}", file=sys.stderr)
+            continue
+        # Auxiliary directories (the extras sink, dotdirs) carry no torrent
+        # association and are excluded from source resolution.
+        if path.name in skip_names or path.name.startswith("."):
+            continue
+        out.append(path)
+    return out
+
+
+def _plan_dirs(cfg: Config, dirs: list[str]) -> tuple[Tracker, list[AlbumPlan]]:
+    tracker = Tracker(cfg)
+    log(tracker.verify())
+    torrent_dir = Path(cfg.torrent_dir).expanduser()
+    log(f"scanning torrents: {torrent_dir}")
+    index = build_torrent_index(torrent_dir)
+    log(f"indexed {len(index.refs)} torrents")
+    source_dirs = _iter_source_dirs(dirs, frozenset({cfg.extra_files_dirname}))
+    log(f"processing {len(source_dirs)} source directories")
+    plans = [build_plan_for_dir(cfg, tracker, index, d) for d in source_dirs]
+    matched = sum(1 for p in plans if p.matched)
+    log(f"done: {matched}/{len(plans)} matched")
+    return tracker, plans
+
+
+def cmd_auth(cfg: Config, args) -> int:
+    """Validate the configured API key without touching the library."""
+    print(Tracker(cfg).verify())
+    return 0
+
+
+def cmd_plan(cfg: Config, args) -> int:
+    _, plans = _plan_dirs(cfg, args.dirs)
+    print_report(plans)
+    write_plan(plans, Path(args.plan))
+    print(f"\nplan written to {args.plan}")
+    return 0
+
+
+def cmd_apply(cfg: Config, args) -> int:
+    plans = load_plan(Path(args.plan))
+    tracker = None
+    if any(p.cover_url or p.artist_image_url for p in plans):
+        try:
+            tracker = Tracker(cfg)
+        except SystemExit:
+            tracker = None
+    apply_plan(cfg, plans, tracker, dry_run=args.dry_run)
+    return 0
+
+
+def cmd_run(cfg: Config, args) -> int:
+    tracker, plans = _plan_dirs(cfg, args.dirs)
+    print_report(plans)
+    plan_path = Path(args.plan)
+    write_plan(plans, plan_path)
+    print(f"\nplan written to {plan_path}")
+    while True:
+        choice = input("[a]pply  [e]dit plan  [q]uit > ").strip().lower()
+        if choice in ("a", "apply"):
+            apply_plan(cfg, load_plan(plan_path), tracker, dry_run=args.dry_run)
+            return 0
+        if choice in ("e", "edit"):
+            os.system(f'{os.environ.get("EDITOR", "nano")} "{plan_path}"')
+            continue
+        if choice in ("q", "quit", ""):
+            print("aborted; no changes made")
+            return 1
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="gaztag", description=__doc__.splitlines()[0])
+    parser.add_argument("--config", default="~/.config/gaztag/config.toml")
+    parser.add_argument("--plan", default="gaztag-plan.json")
+    parser.add_argument("--dest", help="destination root override")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force-art", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="suppress progress output")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_run = sub.add_parser("run", help="plan, confirm, then apply")
+    p_run.add_argument("dirs", nargs="*", default=None)
+    p_run.set_defaults(func=cmd_run)
+
+    p_plan = sub.add_parser("plan", help="resolve metadata and write a plan")
+    p_plan.add_argument("dirs", nargs="*", default=None)
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_apply = sub.add_parser("apply", help="execute a previously written plan")
+    p_apply.set_defaults(func=cmd_apply)
+
+    p_auth = sub.add_parser("auth", help="validate the API key and print the account identity")
+    p_auth.set_defaults(func=cmd_auth)
+
+    args = parser.parse_args(argv)
+    set_progress(not args.quiet)
+    config_path = args.config if Path(args.config).expanduser().exists() else None
+    cfg = Config.load(config_path)
+    if args.dirs is None:
+        dirs = glob.glob("./*/")
+    else:
+        args.dirs = [str(p) for p in Path(".").iterdir() if p.is_dir()]
+    if args.dest:
+        cfg.dest_root = args.dest
+    if args.force_art:
+        cfg.force_art = True
+    return args.func(cfg, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
