@@ -194,6 +194,10 @@ class Config:
     write_catalognumber: bool = False
     # A plain WEB/PCM original with no remaster receives a blank albumversion.
     albumversion_blank_plain: bool = True
+    # Remove a trailing edition segment from the album title when it restates
+    # the release edition already captured structurally (remaster year/title or
+    # a recognized edition keyword), e.g. "Album (2011 Remaster)" -> "Album".
+    strip_album_edition: bool = True
 
     # Artwork.
     fetch_cover: bool = True
@@ -213,6 +217,9 @@ class Config:
     # Leftover-file routing, relative to each source directory's parent (for
     # unmatched images and extras) or the renamed album directory (for booklets).
     handle_aux_files: bool = True
+    # Leftover images (booklet scans, back/inlay/disc art, etc.) are filed in a
+    # subdirectory of the renamed album directory rather than discarded.
+    scans_dirname: str = "scans"
     unmatched_images_dirname: str = "unmatched files"
     extra_files_dirname: str = ".extraFiles"
     booklet_dirname: str = "booklet"
@@ -508,10 +515,12 @@ class RateLimiter:
 
 
 class TrackerError(RuntimeError):
+    """Tracker unavailable. Hopefully it didn't get what.c'd 🤭"""
     pass
 
 
 class AuthError(TrackerError):
+    """Tracker rejected auth token."""
 
 
 def normalize_token(token: str) -> str:
@@ -702,6 +711,52 @@ def build_albumversion(cfg: Config, meta: AlbumMeta, is_dsd: bool) -> str:
             inner_parts.append(meta.remaster_title)
     inner = " ".join(inner_parts).strip()
     return (base + (f" ({inner})" if inner else "")).strip()
+
+
+# Edition keywords that mark a trailing title segment as a restatement of the
+# release edition rather than part of the canonical album name.
+_EDITION_KEYWORDS = (
+    "remaster", "remastered", "reissue", "re-issue", "deluxe", "expanded",
+    "anniversary", "SHM", "MFSL", "UACD", "edition", "version", "remix", "remixed", "mono", "stereo",
+    "special edition", "collector", "bonus track", "bonus tracks",
+)
+# A trailing parenthesized or bracketed segment at the end of a title.
+_TRAILING_SEGMENT = re.compile(r"\s*[\(\[]([^\(\)\[\]]*)[\)\]]\s*$")
+
+
+def strip_album_edition(cfg: Config, meta: AlbumMeta) -> str:
+    """Return the album title with a redundant trailing edition segment removed.
+
+    A trailing "(...)" or "[...]" segment is removed when its contents restate
+    the release edition: the remaster year or remaster title appears within it,
+    or it contains a recognized edition keyword. Segments that form part of the
+    canonical title (e.g. "Album (Original Motion Picture Soundtrack)") are not
+    matched by the keyword set and are preserved. Only the final segment is
+    considered, and removal runs at most once.
+    """
+    title = meta.album
+    if not cfg.strip_album_edition or not title:
+        return title
+    match = _TRAILING_SEGMENT.search(title)
+    if not match:
+        return title
+    segment = match.group(1).strip()
+    seg_lower = segment.lower()
+    redundant = False
+    if meta.remaster_year and str(meta.remaster_year) in segment:
+        redundant = True
+    if meta.remaster_title and meta.remaster_title.lower() in seg_lower:
+        redundant = True
+    if any(kw in seg_lower for kw in _EDITION_KEYWORDS):
+        redundant = True
+    if not redundant:
+        return title
+    stripped = title[: match.start()].strip()
+    # A title consisting solely of an edition segment is left intact; there is
+    # no canonical name to fall back to.
+    if not stripped:
+        return title
+    return stripped
 
 
 def resolve_album(tracker: Tracker, ref: TorrentRef) -> dict:
@@ -906,6 +961,17 @@ def image_dimensions(path: Path) -> Optional[tuple[int, int]]:
         return None
 
 
+def image_dimensions_bytes(data: bytes) -> Optional[tuple[int, int]]:
+    if Image is None:
+        return None
+    try:
+        from io import BytesIO
+        with Image.open(BytesIO(data)) as img:
+            return img.size
+    except Exception:
+        return None
+
+
 def _cover_qualifies(path: Path, min_px: int) -> bool:
     dims = image_dimensions(path)
     if dims is None:
@@ -921,6 +987,10 @@ class AuxClassification:
     booklets: list[Path] = field(default_factory=list)
     extras: list[Path] = field(default_factory=list)
     ambiguous_cover: bool = False
+    # The selected cover falls below cfg.min_cover_px on its shorter side and is
+    # therefore provisional: a remote candidate meeting the threshold supersedes
+    # it, in which case the local image is diverted to unmatched files.
+    cover_below_threshold: bool = False
 
 
 def classify_aux_files(cfg: Config, source_dir: Path) -> AuxClassification:
@@ -928,8 +998,10 @@ def classify_aux_files(cfg: Config, source_dir: Path) -> AuxClassification:
 
     The cover is a qualifying image (at least cfg.min_cover_px on its shorter
     side) that is either named like a cover or is the only qualifying image.
-    When several images qualify and none is named like a cover, selection is
-    ambiguous: no cover is chosen and every image is treated as an other-image.
+    A single image in the source directory is treated as the cover regardless
+    of the pixel gate. When several images qualify and none is named like a
+    cover, selection is ambiguous: no cover is chosen and every image is filed
+    under the scans subdirectory.
     """
     result = AuxClassification()
     images: list[Path] = []
@@ -948,7 +1020,9 @@ def classify_aux_files(cfg: Config, source_dir: Path) -> AuxClassification:
 
     eligible = [im for im in images if im.suffix.lower() in COVER_IMAGE_EXTENSIONS]
     qualifying = [im for im in eligible if _cover_qualifies(im, cfg.min_cover_px)]
-    named = [im for im in qualifying if im.stem.lower() in COVER_NAME_STEMS]
+    # A cover-named image is selected even below the pixel gate; explicit naming
+    # is treated as stronger evidence than resolution.
+    named = [im for im in eligible if im.stem.lower() in COVER_NAME_STEMS]
     cover: Optional[Path] = None
     if named:
         cover = named[0]
@@ -956,8 +1030,18 @@ def classify_aux_files(cfg: Config, source_dir: Path) -> AuxClassification:
         cover = qualifying[0]
     elif len(qualifying) > 1:
         result.ambiguous_cover = True
+    elif len(eligible) == 1:
+        # No image meets the pixel gate, but a sole image in the directory is
+        # assumed to be album art rather than a scan.
+        cover = eligible[0]
+    elif len(images) == 1:
+        # Sole image of any recognized type, including formats not eligible for
+        # in-place cover use; retained as cover for downstream conversion.
+        cover = images[0]
 
     result.cover = cover
+    if cover is not None and cover not in qualifying:
+        result.cover_below_threshold = True
     result.other_images = [im for im in images if im != cover]
     return result
 
@@ -1108,6 +1192,10 @@ class AlbumPlan:
     files: list[FileOp] = field(default_factory=list)
     cover_url: Optional[str] = None
     cover_dest: Optional[str] = None
+    # Remote cover bytes fetched at plan time when adjudicating a provisional
+    # local cover against a remote candidate; reused during apply to avoid a
+    # second download. Not serialized to the plan JSON.
+    cover_data: Optional[bytes] = field(default=None, repr=False)
     local_cover_src: Optional[str] = None
     local_cover_convert: bool = False
     artist_image_url: Optional[str] = None
@@ -1169,6 +1257,14 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
     if albumversion:
         log(f"  version: {albumversion}")
 
+    # The album title used for tagging has any redundant trailing edition
+    # segment removed. The directory name retains the original title, including
+    # the edition, so that distinct releases of the same album resolve to
+    # separate directories rather than colliding on the filesystem.
+    album_title = strip_album_edition(cfg, meta)
+    if album_title != meta.album:
+        log(f"  album tag: edition stripped ({meta.album!r} -> {album_title!r})")
+
     dest_root = Path(cfg.dest_root).expanduser() if cfg.dest_root else source_dir.parent
     if is_dsd and cfg.dsd_subdir:
         dest_root = dest_root / cfg.dsd_subdir
@@ -1187,7 +1283,7 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
     album_dir = artist_dir / _clean_dir_name(album_dir_name)
 
     plan.matched = True
-    plan.album = meta.album
+    plan.album = album_title
     plan.year = meta.year
     plan.album_artist = meta.album_artist
     plan.genres = meta.genres
@@ -1217,37 +1313,91 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
 
     # Included artwork and other leftover payload.
     aux = classify_aux_files(cfg, source_dir) if cfg.handle_aux_files else AuxClassification()
+    scans_root = album_dir / cfg.scans_dirname
     unmatched_root = source_dir.parent / cfg.unmatched_images_dirname / source_dir.name
     extras_root = source_dir.parent / cfg.extra_files_dirname / source_dir.name
     booklet_root = album_dir / cfg.booklet_dirname
 
     cover_chosen = False
+    provisional_local: Optional[Path] = None
     if cfg.use_included_cover and aux.cover is not None:
-        dest, convert = cover_destination(cfg, album_dir, aux.cover)
-        plan.local_cover_src = str(aux.cover)
-        plan.local_cover_convert = convert
-        plan.cover_dest = str(dest)
-        cover_chosen = True
-        log(f"  cover: included ({aux.cover.name}{' -> jpg' if convert else ''})")
+        if aux.cover_below_threshold:
+            # A sub-threshold local cover is held pending remote adjudication
+            # rather than committed outright.
+            provisional_local = aux.cover
+        else:
+            dest, convert = cover_destination(cfg, album_dir, aux.cover)
+            plan.local_cover_src = str(aux.cover)
+            plan.local_cover_convert = convert
+            plan.cover_dest = str(dest)
+            cover_chosen = True
+            log(f"  cover: included ({aux.cover.name}{' -> jpg' if convert else ''})")
 
     if not cover_chosen and cfg.fetch_cover and (cfg.force_art or not has_cover_sidecar(album_dir)):
         url = resolve_cover(cfg, tracker.session, meta)
-        if url:
+        if url and provisional_local is not None:
+            # Adjudicate the provisional local cover against the remote
+            # candidate. The remote supersedes only when it meets the pixel
+            # gate; otherwise the local image is retained despite its size.
+            data = fetch_url_bytes(tracker.session, url, cfg.request_timeout)
+            dims = image_dimensions_bytes(data) if data else None
+            remote_qualifies = dims is not None and min(dims) >= cfg.min_cover_px
+            if data and remote_qualifies:
+                plan.cover_url = url
+                plan.cover_data = data
+                plan.cover_dest = str(album_dir / cfg.cover_filename)
+                cover_chosen = True
+                # The superseded local image is diverted to unmatched files for
+                # visibility, on the premise that a size-deficient local match
+                # may still be preferable to the remote result.
+                plan.unmatched_images.append(
+                    AuxMove(str(provisional_local),
+                            str(unmatched_root / provisional_local.name)))
+                log(f"  cover: remote supersedes low-res local "
+                    f"({provisional_local.name} -> {cfg.unmatched_images_dirname})")
+            else:
+                dest, convert = cover_destination(cfg, album_dir, provisional_local)
+                plan.local_cover_src = str(provisional_local)
+                plan.local_cover_convert = convert
+                plan.cover_dest = str(dest)
+                cover_chosen = True
+                log(f"  cover: low-res local retained; remote absent or "
+                    f"below threshold ({provisional_local.name})")
+        elif url:
             plan.cover_url = url
             plan.cover_dest = str(album_dir / cfg.cover_filename)
-            log("  cover: fetched from " + ("tracker/itunes"))
+            cover_chosen = True
+            log("  cover: fetched from tracker/itunes")
+        elif provisional_local is not None:
+            # No remote candidate resolved; the provisional local cover stands.
+            dest, convert = cover_destination(cfg, album_dir, provisional_local)
+            plan.local_cover_src = str(provisional_local)
+            plan.local_cover_convert = convert
+            plan.cover_dest = str(dest)
+            cover_chosen = True
+            log(f"  cover: low-res local retained; no remote candidate "
+                f"({provisional_local.name})")
         else:
             log("  cover: not found")
             plan.warnings.append("cover art could not be resolved")
+    elif provisional_local is not None and not cover_chosen:
+        # Remote fetch disabled or a sidecar already exists; retain the local
+        # image rather than discarding it for being small.
+        dest, convert = cover_destination(cfg, album_dir, provisional_local)
+        plan.local_cover_src = str(provisional_local)
+        plan.local_cover_convert = convert
+        plan.cover_dest = str(dest)
+        cover_chosen = True
+        log(f"  cover: low-res local retained ({provisional_local.name})")
 
     for img in aux.other_images:
-        plan.unmatched_images.append(AuxMove(str(img), str(unmatched_root / img.name)))
+        plan.unmatched_images.append(AuxMove(str(img), str(scans_root / img.name)))
     for doc in aux.booklets:
         plan.booklet_files.append(AuxMove(str(doc), str(booklet_root / doc.name)))
     for extra in aux.extras:
         plan.extra_files.append(AuxMove(str(extra), str(extras_root / extra.name)))
     if aux.ambiguous_cover:
-        log(f"  cover: ambiguous; {len(aux.other_images)} images -> unmatched files")
+        log(f"  cover: ambiguous; {len(aux.other_images)} images -> {cfg.scans_dirname}")
     aux_counts = []
     if plan.booklet_files:
         aux_counts.append(f"{len(plan.booklet_files)} booklet")
@@ -1307,7 +1457,7 @@ def print_report(plans: list[AlbumPlan]) -> None:
             booklet_dir = Path(plan.booklet_files[0].dest).parent
             print(f"BOOKLET: {len(plan.booklet_files)} -> {booklet_dir}")
         for m in plan.unmatched_images:
-            print(f"  image (unmatched) {Path(m.src).name} -> {m.dest}")
+            print(f"  image (scan) {Path(m.src).name} -> {m.dest}")
         for m in plan.extra_files:
             print(f"  extra {Path(m.src).name} -> {m.dest}")
         if plan.artist_image_dest:
@@ -1322,7 +1472,13 @@ def print_report(plans: list[AlbumPlan]) -> None:
 # --------------------------------------------------------------------------- #
 
 def plan_to_dict(plans: list[AlbumPlan]) -> dict:
-    return {"albums": [dataclasses.asdict(p) for p in plans]}
+    # cover_data holds raw bytes for in-process reuse and is not JSON-encodable;
+    # it is dropped on serialization and re-fetched from cover_url if needed.
+    def _encode(p: AlbumPlan) -> dict:
+        d = dataclasses.asdict(p)
+        d.pop("cover_data", None)
+        return d
+    return {"albums": [_encode(p) for p in plans]}
 
 
 def dict_to_plans(data: dict) -> list[AlbumPlan]:
@@ -1390,7 +1546,8 @@ def apply_plan(cfg: Config, plans: list[AlbumPlan], tracker: Optional[Tracker],
         elif plan.cover_url and plan.cover_dest:
             print(f"cover (remote) -> {plan.cover_dest}")
             if not dry_run:
-                data = fetch_url_bytes(session, plan.cover_url, cfg.request_timeout)
+                data = plan.cover_data or fetch_url_bytes(
+                    session, plan.cover_url, cfg.request_timeout)
                 if data:
                     _save_image(data, Path(plan.cover_dest), cfg.max_art_px)
 
@@ -1481,6 +1638,11 @@ def _iter_source_dirs(paths: list[str], skip_names: frozenset[str] = frozenset()
 
 
 def _plan_dirs(cfg: Config, dirs: list[str]) -> tuple[Tracker, list[AlbumPlan]]:
+    # An empty argument list expands to the immediate subdirectories of the
+    # current working directory, treating each as a candidate album source.
+    # _iter_source_dirs subsequently filters auxiliary and hidden directories.
+    if not dirs:
+        dirs = sorted(str(p) for p in Path(".").iterdir() if p.is_dir())
     tracker = Tracker(cfg)
     log(tracker.verify())
     torrent_dir = Path(cfg.torrent_dir).expanduser()
@@ -1552,11 +1714,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="plan, confirm, then apply")
-    p_run.add_argument("dirs", nargs="*", default=None)
+    p_run.add_argument("dirs", nargs="*")
     p_run.set_defaults(func=cmd_run)
 
     p_plan = sub.add_parser("plan", help="resolve metadata and write a plan")
-    p_plan.add_argument("dirs", nargs="*", default=None)
+    p_plan.add_argument("dirs", nargs="*")
     p_plan.set_defaults(func=cmd_plan)
 
     p_apply = sub.add_parser("apply", help="execute a previously written plan")
@@ -1569,10 +1731,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     set_progress(not args.quiet)
     config_path = args.config if Path(args.config).expanduser().exists() else None
     cfg = Config.load(config_path)
-    if args.dirs is None:
-        dirs = glob.glob("./*/")
-    else:
-        args.dirs = [str(p) for p in Path(".").iterdir() if p.is_dir()]
     if args.dest:
         cfg.dest_root = args.dest
     if args.force_art:
