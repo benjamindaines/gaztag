@@ -7,6 +7,8 @@ Edit the config file and put it in ~/.config/gaztag/config.toml
 
 ![demo gif](https://github.com/benjamindaines/gaztag/blob/master/demo.gif?raw=true)
 
+![screenshot](https://github.com/benjamindaines/gaztag/blob/master/screenshot.png?raw=true)
+
 ```
 usage: gaztag [-h] [--config CONFIG] [--plan PLAN] [--dest DEST] [--dry-run] [--force-art] [-q]
               {run,plan,apply,auth} ...
