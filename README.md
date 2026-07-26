@@ -6,7 +6,7 @@ Tags album versions, genres, downloads album art, sorts scans and booklets, flat
 Edit the config file and put it in ~/.config/gaztag/config.toml
 
 ![demo gif](https://github.com/benjamindaines/gaztag/blob/master/demo.gif?raw=true)
-
+(I promise I don't use nano... don't judge. Would be hilarious, but rude to hard-code vim as the editor 😁)
 ![screenshot](https://github.com/benjamindaines/gaztag/blob/master/screenshot.png?raw=true)
 
 ```
