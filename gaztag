@@ -23,6 +23,7 @@ import argparse
 import dataclasses
 import difflib
 import hashlib
+import html
 import json
 import os
 import re
@@ -33,6 +34,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
 try:
     import tomllib  # Python 3.11+
@@ -73,6 +75,28 @@ EXTRA_EXTENSIONS = {".cue", ".log", ".m3u", ".m3u8", ".nfo", ".sfv", ".txt",
 DISC_DIR_RE = re.compile(r"^(?:disc|disk|cd|vol(?:ume)?)\s*[.\-_]?\s*0*(\d+)\b", re.IGNORECASE)
 LEADING_NUM_RE = re.compile(r"^\s*(\d{1,3})")
 TORRENTID_RE = re.compile(r"torrentid=(\d+)")
+
+# Seconds of margin subtracted from an imgauth credential's expiry before it is
+# considered stale and re-requested, absorbing clock skew and in-flight latency.
+IMGAUTH_EXPIRY_MARGIN = 60
+# Recognized per-tracker image-authorization schemes.
+IMG_AUTH_SCHEMES = ("none", "imgauth", "proxy")
+
+
+def decode_entities(value: str) -> str:
+    """Resolve HTML character references in a tracker-sourced string.
+
+    Gazelle stores free-text fields (release name, artist, label, catalogue
+    number, remaster fields, tags) HTML-escaped and returns them unmodified over
+    ajax.php, so an accented title such as "Segue" arrives as "Segu&eacute;".
+    html.unescape resolves both named ("&eacute;") and numeric ("&#233;")
+    references. Titles containing a literal ampersand are unaffected: a stored
+    "Q&amp;A" decodes to "Q&A", and a non-entity sequence such as "Q&A" is
+    returned unchanged.
+    """
+    if not value:
+        return value
+    return html.unescape(value)
 
 # Tracker release-type integer codes mapped to display names.
 RELEASE_TYPE_NAMES = {
@@ -135,14 +159,63 @@ DEFAULT_VA_RELEASE_TYPES = {3, 7}  # Soundtrack, Compilation
 
 
 @dataclass
-class Config:
-    # Tracker access. base_url is the site origin, e.g. "https://tracker.example".
+class TrackerProfile:
+    """Per-tracker access parameters.
+
+    A configuration may declare several profiles; each ".torrent" file is
+    attributed to one profile by its embedded "source" tag (the cross-seed
+    marker written into the info dictionary, e.g. "RED", "OPS") or by its
+    announce hostname.
+    """
+    name: str = "default"
     base_url: str = ""
     api_token: str = ""
-    # This is the directory where your torrent client (or you) store .torrent files
-    # that have been added to your client. Ex. Transmission renames to .torrent.added
-    # and keeps them in the watched directory for auto-add.
-    torrent_dir: str = ""
+    # Image-host authorization scheme:
+    #   "none"    - image URLs are fetched directly (third-party/persistent host).
+    #   "imgauth" - a credential {h, e, u} is obtained from ajax.php?action=imgauth
+    #               and appended as query parameters to image URLs on img_host,
+    #               cached until its expiry. Used by trackers that rehost art on
+    #               their own host behind a token gate (e.g. RED). If the
+    #               credential cannot be obtained, the image is left unfetched;
+    #               no unauthorized request is attempted.
+    #   "proxy"   - the torrent response's "proxyImage" field, an official,
+    #               short-lived rehost URL, is the sole source (e.g. OPS). It is
+    #               fetched at plan time. Public origins are better served by the
+    #               "none" scheme.
+    # Each scheme uses one sanctioned source and fails closed; no scheme falls
+    # back to an alternative source or an unauthorized request.
+    img_auth: str = "none"
+    # Host that img_auth applies to. Empty defaults to the base_url host.
+    img_host: str = ""
+    # Per-tracker rate limit and timeout. None inherits the global Config value.
+    requests_per_window: Optional[int] = None
+    window_seconds: Optional[float] = None
+    request_timeout: Optional[float] = None
+    # Identification of the originating tracker from a ".torrent" file. source_tag
+    # matches the info-dictionary "source" field; announce_hosts matches the
+    # announce URL hostname(s). source_tag is preferred as it survives client
+    # re-announce edits.
+    source_tag: str = ""
+    announce_hosts: tuple = ()
+
+
+@dataclass
+class Config:
+    # Legacy single-tracker access. Retained for backward compatibility; when no
+    # [[tracker]] tables are present these synthesize one profile. base_url is
+    # the site origin, e.g. "https://tracker.example".
+    base_url: str = ""
+    api_token: str = ""
+    img_auth: str = "none"
+    img_host: str = ""
+    # Populated during load from [[tracker]] tables, or synthesized from the
+    # legacy fields above. list[TrackerProfile].
+    trackers: list = field(default_factory=list)
+    # Directory (or list of directories) where the torrent client stores
+    # ".torrent" / ".torrent.added" files. The content name of each torrent is
+    # matched against source directory names. Multiple directories are scanned in
+    # order into a single index, permitting per-tracker watch directories.
+    torrent_dir: Any = ""
 
     # Destination root. Empty writes in place, beside each source directory.
     dest_root: str = ""
@@ -227,8 +300,12 @@ class Config:
     @classmethod
     def load(cls, path: Optional[str]) -> "Config":
         cfg = cls()
+        raw_trackers: list = []
         if path:
             data = _read_toml(Path(path).expanduser())
+            # [[tracker]] tables are consumed separately; they do not map to a
+            # scalar Config attribute.
+            raw_trackers = data.pop("tracker", None) or []
             for key, value in data.items():
                 if not hasattr(cfg, key):
                     print(f"warning: unknown config key '{key}' ignored", file=sys.stderr)
@@ -242,8 +319,7 @@ class Config:
                     setattr(cfg, key, tuple(value))
                 else:
                     setattr(cfg, key, value)
-        cfg.api_token = os.environ.get("RED_API_TOKEN", cfg.api_token)
-        cfg.base_url = os.environ.get("RED_BASE_URL", cfg.base_url).rstrip("/")
+        cfg.trackers = _build_tracker_profiles(cfg, raw_trackers)
         return cfg
 
 
@@ -254,6 +330,82 @@ def _read_toml(path: Path) -> dict:
         raise SystemExit("tomllib unavailable; Python 3.11+ is required for TOML config")
     with path.open("rb") as fh:
         return tomllib.load(fh)
+
+
+def _host_of(value: str) -> str:
+    """Return the hostname of a URL or bare host string, lowercased."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    host = urlsplit(value).hostname if "//" in value else value
+    return (host or value).lower()
+
+
+def _host_list(value: Any) -> tuple:
+    """Normalize an announce-host specification into a tuple of hostnames.
+
+    A string or list of strings is accepted; URL forms are reduced to hostname.
+    """
+    if not value:
+        return ()
+    items = [value] if isinstance(value, str) else list(value)
+    return tuple(h for h in (_host_of(v) for v in items) if h)
+
+
+def _build_tracker_profiles(cfg: "Config", raw_trackers: list) -> list:
+    """Construct the ordered list of TrackerProfile from parsed configuration.
+
+    [[tracker]] tables take precedence. In their absence a single profile is
+    synthesized from the legacy top-level fields, preserving prior behavior.
+    Environment variables RED_API_TOKEN / RED_BASE_URL override the first
+    profile so existing invocations remain valid.
+    """
+    def _scheme(value: Any) -> str:
+        scheme = (value or "none").strip().lower()
+        if scheme not in IMG_AUTH_SCHEMES:
+            print(f"warning: unknown img_auth '{scheme}' treated as 'none'", file=sys.stderr)
+            return "none"
+        return scheme
+
+    profiles: list = []
+    for i, t in enumerate(raw_trackers):
+        base = (t.get("base_url") or "").strip().rstrip("/")
+        name = t.get("name") or _host_of(base) or f"tracker{i + 1}"
+        profiles.append(TrackerProfile(
+            name=name,
+            base_url=base,
+            api_token=t.get("api_token", ""),
+            img_auth=_scheme(t.get("img_auth")),
+            img_host=_host_of(t.get("img_host") or ""),
+            requests_per_window=t.get("requests_per_window"),
+            window_seconds=t.get("window_seconds"),
+            request_timeout=t.get("request_timeout"),
+            source_tag=(t.get("source") or t.get("source_tag") or "").strip(),
+            announce_hosts=_host_list(t.get("announce_hosts") or t.get("announce_host")),
+        ))
+    if not profiles:
+        base = (cfg.base_url or "").strip().rstrip("/")
+        profiles.append(TrackerProfile(
+            name=_host_of(base) or "default",
+            base_url=base,
+            api_token=cfg.api_token,
+            img_auth=_scheme(cfg.img_auth),
+            img_host=_host_of(cfg.img_host or ""),
+        ))
+    env_token = os.environ.get("RED_API_TOKEN")
+    env_url = os.environ.get("RED_BASE_URL")
+    if env_token:
+        profiles[0].api_token = env_token
+    if env_url:
+        profiles[0].base_url = env_url.rstrip("/")
+    return profiles
+
+
+def _torrent_dirs(cfg: "Config") -> list:
+    """Return the configured torrent watch directories as a list of Path."""
+    value = cfg.torrent_dir
+    items = [value] if isinstance(value, str) else list(value or [])
+    return [Path(p).expanduser() for p in items if str(p).strip()]
 
 
 # --------------------------------------------------------------------------- #
@@ -329,6 +481,8 @@ class TorrentRef:
     filename_id: Optional[int] = None  # id from the filename; may be truncated
     audio_sizes: tuple = ()          # sorted sizes of audio payload files
     audio_names: tuple = ()          # basenames of audio payload files
+    source: Optional[str] = None     # info-dictionary cross-seed source tag
+    announce_host: Optional[str] = None  # hostname of the announce URL
 
 
 def _torrent_filename_stem(path: Path) -> str:
@@ -411,9 +565,15 @@ def parse_torrent(path: Path) -> Optional[TorrentRef]:
     audio = _torrent_audio_files(info)
     audio_sizes = tuple(sorted(size for _, size in audio))
     audio_names = tuple(basename for basename, _ in audio)
+    source_b = info.get(b"source")
+    source = source_b.decode("utf-8", "replace").strip() if source_b else None
+    announce_host = None
+    announce_b = meta.get(b"announce")
+    if announce_b:
+        announce_host = (urlsplit(announce_b.decode("utf-8", "replace")).hostname or "").lower() or None
     return TorrentRef(path=path, name=name, infohash=infohash, torrent_id=torrent_id,
                       filename_id=filename_id, audio_sizes=audio_sizes,
-                      audio_names=audio_names)
+                      audio_names=audio_names, source=source, announce_host=announce_host)
 
 
 def _dir_audio_sizes(source_dir: Path) -> tuple:
@@ -474,10 +634,11 @@ class TorrentIndex:
         return MatchResult(None, "", matches[0] if matches else "")
 
 
-def build_torrent_index(torrent_dir: Path) -> TorrentIndex:
-    index = TorrentIndex()
+def scan_torrents_into(index: TorrentIndex, torrent_dir: Path) -> int:
+    """Parse every torrent under torrent_dir into index; return the count added."""
     if not torrent_dir.exists():
-        return index
+        return 0
+    added = 0
     for path in sorted(torrent_dir.rglob("*")):
         if not path.is_file():
             continue
@@ -487,6 +648,13 @@ def build_torrent_index(torrent_dir: Path) -> TorrentIndex:
         ref = parse_torrent(path)
         if ref is not None:
             index.add(ref)
+            added += 1
+    return added
+
+
+def build_torrent_index(torrent_dir: Path) -> TorrentIndex:
+    index = TorrentIndex()
+    scan_torrents_into(index, torrent_dir)
     return index
 
 
@@ -532,28 +700,123 @@ def normalize_token(token: str) -> str:
 
 
 class Tracker:
-    def __init__(self, cfg: Config):
-        token = normalize_token(cfg.api_token)
-        base_url = (cfg.base_url or "").strip().rstrip("/")
+    def __init__(self, profile: TrackerProfile, cfg: Config):
+        token = normalize_token(profile.api_token)
+        base_url = (profile.base_url or "").strip().rstrip("/")
         if not base_url or not token:
             raise SystemExit(
-                "tracker base_url and api_token must be set. Generate an API key "
-                "in the tracker user settings and provide it via the RED_API_TOKEN "
-                "environment variable or the config file."
+                f"tracker '{profile.name}' requires base_url and api_token. Generate "
+                "an API key in the tracker user settings and provide it via the "
+                "config file (or the RED_API_TOKEN environment variable for the "
+                "first tracker)."
             )
+        self.name = profile.name
         self.base_url = base_url
-        self.timeout = cfg.request_timeout
-        self.limiter = RateLimiter(cfg.requests_per_window, cfg.window_seconds)
+        self.img_auth = profile.img_auth
+        self.img_host = profile.img_host or (urlsplit(base_url).hostname or "").lower()
+        # Rate limit and timeout fall back to the global Config defaults when the
+        # profile leaves them unset.
+        rpw = profile.requests_per_window if profile.requests_per_window is not None else cfg.requests_per_window
+        win = profile.window_seconds if profile.window_seconds is not None else cfg.window_seconds
+        self.timeout = profile.request_timeout if profile.request_timeout is not None else cfg.request_timeout
+        self.limiter = RateLimiter(rpw, win)
         self.session = requests.Session()
-        # Authentication is a single header carrying the bare API key, sent with
-        # every request. This key-only scheme avoids the login/cookie flow and
-        # works for accounts with two-factor authentication enabled.
+        # API authentication is a single header carrying the bare API key, sent
+        # with every ajax.php request. This key-only scheme avoids the login flow
+        # and works for accounts with two-factor authentication enabled.
         self.session.headers.update({
             "Authorization": token,
             "User-Agent": "gaztag/0.2",
         })
         self._artist_cache: dict[int, dict] = {}
         self._identity: Optional[dict] = None
+        # Cached imgauth credential: {"h": str, "e": int, "u": Any}.
+        self._imgauth: Optional[dict] = None
+
+    def _imgauth_params(self) -> dict:
+        """Return the imgauth query parameters, refreshing the cache on expiry.
+
+        The credential is obtained from ajax.php?action=imgauth and reused until
+        it approaches its expiry timestamp. The three fields (h, e, u) are the
+        tracker's image-host access token and are handled as secret material:
+        they are never written to the plan JSON.
+        """
+        now = time.time()
+        cache = self._imgauth
+        if cache is None or now >= cache["e"] - IMGAUTH_EXPIRY_MARGIN:
+            resp = self._ajax("imgauth")
+            self._imgauth = {"h": resp["h"], "e": int(resp["e"]), "u": resp["u"]}
+        return {"h": self._imgauth["h"], "e": self._imgauth["e"], "u": self._imgauth["u"]}
+
+    def authorize_image_url(self, url: str) -> str:
+        """Append imgauth credentials to an image URL on the tracker image host.
+
+        Applies only under the "imgauth" scheme and only to URLs whose host is
+        the configured image host; all other URLs are returned unchanged.
+        """
+        if self.img_auth != "imgauth" or not url:
+            return url
+        if (urlsplit(url).hostname or "").lower() != self.img_host:
+            return url
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.update({k: str(v) for k, v in self._imgauth_params().items()})
+        return urlunsplit(parts._replace(query=urlencode(query)))
+
+    def fetch_image(self, url: Optional[str], proxy_image: Optional[str] = None) -> Optional[bytes]:
+        """Retrieve image bytes through the tracker's sanctioned path only.
+
+        Each scheme uses a single official source and fails closed: when the
+        sanctioned path cannot be authorized or is not provided, None is returned
+        and no unauthorized request or alternative source is attempted.
+
+          imgauth - the URL is authorized with the imgauth credential when it
+                    targets the tracker image host. A 403 on the image host is
+                    treated as a possibly-invalidated credential: it is refreshed
+                    once and the request retried. A persistent 403, any other
+                    error, or an inability to obtain the credential leaves the
+                    image unfetched. An off-host URL (a public third-party origin)
+                    requires no tracker authorization and is fetched as returned.
+          proxy   - only the tracker-provided proxyImage is used. A group without
+                    a proxyImage yields no fetch; public origins should instead be
+                    handled with the "none" scheme.
+          none    - the URL is fetched directly.
+        """
+        if self.img_auth == "imgauth":
+            return self._fetch_imgauth(url)
+        if self.img_auth == "proxy":
+            return fetch_url_bytes(self.session, proxy_image, self.timeout) if proxy_image else None
+        return fetch_url_bytes(self.session, url, self.timeout) if url else None
+
+    def _fetch_imgauth(self, url: Optional[str]) -> Optional[bytes]:
+        if not url:
+            return None
+        # A credential is appended only for the image host; an off-host origin
+        # cannot be repaired by re-authorization and is attempted once.
+        on_image_host = (urlsplit(url).hostname or "").lower() == self.img_host
+        attempts = 2 if on_image_host else 1
+        for attempt in range(attempts):
+            try:
+                target = self.authorize_image_url(url)
+            except (TrackerError, requests.RequestException) as exc:
+                log(f"  imgauth authorization unavailable ({exc}); image left unfetched")
+                return None
+            try:
+                resp = self.session.get(target, timeout=self.timeout)
+            except requests.RequestException as exc:
+                log(f"  image request failed ({exc}); image left unfetched")
+                return None
+            if resp.status_code == 200:
+                return resp.content
+            if resp.status_code == 403 and on_image_host and attempt == 0:
+                # The credential may have been invalidated ahead of its stated
+                # expiry; discard the cached value and re-authorize once.
+                log("  image host returned 403; refreshing imgauth credential and retrying")
+                self._imgauth = None
+                continue
+            log(f"  image host returned HTTP {resp.status_code}; image left unfetched")
+            return None
+        return None
 
     def _ajax(self, action: str, **params) -> dict:
         self.limiter.acquire()
@@ -592,7 +855,7 @@ class Tracker:
             raise SystemExit(f"tracker unreachable during authentication: {exc}")
         username = ident.get("username", "?")
         api_version = ident.get("api_version", "?")
-        return f"authenticated as {username} (api {api_version})"
+        return f"[{self.name}] authenticated as {username} (api {api_version})"
 
     def torrent_by_hash(self, infohash: str) -> dict:
         return self._ajax("torrent", hash=infohash.upper())
@@ -604,6 +867,71 @@ class Tracker:
         if artist_id not in self._artist_cache:
             self._artist_cache[artist_id] = self._ajax("artist", id=artist_id)
         return self._artist_cache[artist_id]
+
+
+class TrackerRegistry:
+    """Attributes torrents to tracker profiles.
+
+    Resolution order: the info-dictionary source tag, then the announce
+    hostname (exact, then parent/child suffix). When a single profile is
+    configured it is returned unconditionally, preserving single-tracker
+    behavior for torrents that carry neither identifier.
+    """
+
+    def __init__(self, profiles: list) -> None:
+        self.profiles = list(profiles)
+        self._by_source: dict[str, TrackerProfile] = {}
+        self._by_host: dict[str, TrackerProfile] = {}
+        for p in self.profiles:
+            if p.source_tag:
+                self._by_source.setdefault(p.source_tag.lower(), p)
+            for h in p.announce_hosts:
+                self._by_host.setdefault(h, p)
+
+    def resolve(self, ref: TorrentRef) -> Optional[TrackerProfile]:
+        if ref.source and ref.source.lower() in self._by_source:
+            return self._by_source[ref.source.lower()]
+        host = (ref.announce_host or "").lower()
+        if host:
+            if host in self._by_host:
+                return self._by_host[host]
+            for known, profile in self._by_host.items():
+                if host.endswith("." + known) or known.endswith("." + host):
+                    return profile
+        if len(self.profiles) == 1:
+            return self.profiles[0]
+        return None
+
+
+class TrackerPool:
+    """Lazily instantiates and caches Tracker clients keyed by profile name.
+
+    A single run may address several trackers; each client is created and
+    verified once on first use.
+    """
+
+    def __init__(self, cfg: Config, registry: TrackerRegistry) -> None:
+        self.cfg = cfg
+        self.registry = registry
+        self._by_name: dict[str, Tracker] = {}
+
+    def get(self, profile: TrackerProfile) -> Tracker:
+        tracker = self._by_name.get(profile.name)
+        if tracker is None:
+            tracker = Tracker(profile, self.cfg)
+            log(tracker.verify())
+            self._by_name[profile.name] = tracker
+        return tracker
+
+    def for_ref(self, ref: TorrentRef) -> Optional[Tracker]:
+        profile = self.registry.resolve(ref)
+        return self.get(profile) if profile is not None else None
+
+    def by_name(self, name: str) -> Optional[Tracker]:
+        for profile in self.registry.profiles:
+            if profile.name == name:
+                return self.get(profile)
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -627,6 +955,7 @@ class AlbumMeta:
     remaster_title: str
     remaster_label: str
     wiki_image: Optional[str]
+    proxy_image: Optional[str]
     raw_tags: list[str]
 
 
@@ -638,8 +967,8 @@ def _derive_album_artist(cfg: Config, music_info: dict, release_type: int) -> tu
         return cfg.various_artists_label, None
     if len(artists) == 1:
         a = artists[0]
-        return a["name"], a.get("id")
-    names = cfg.artist_join.join(a["name"] for a in artists)
+        return decode_entities(a["name"]), a.get("id")
+    names = cfg.artist_join.join(decode_entities(a["name"]) for a in artists)
     return names, artists[0].get("id")
 
 
@@ -674,22 +1003,26 @@ def build_album_meta(cfg: Config, response: dict) -> AlbumMeta:
     album_artist, artist_id = _derive_album_artist(cfg, music_info, release_type)
     raw_tags = group.get("tags") or []
     rt_name = "" if release_type in RELEASE_TYPE_BLANK else RELEASE_TYPE_NAMES.get(release_type, "")
+    # Free-text fields sourced from the tracker are HTML-entity-decoded. Genre
+    # tags are slugs (no entities) and the media code is a controlled vocabulary,
+    # so neither is decoded. wiki_image is a URL and is left verbatim.
     return AlbumMeta(
-        album=(group.get("name") or "").strip(),
+        album=decode_entities((group.get("name") or "").strip()),
         year=int(group.get("year") or 0),
         album_artist=album_artist.strip(),
         artist_id=artist_id,
-        label=(group.get("recordLabel") or "").strip(),
-        catalog=(group.get("catalogueNumber") or "").strip(),
+        label=decode_entities((group.get("recordLabel") or "").strip()),
+        catalog=decode_entities((group.get("catalogueNumber") or "").strip()),
         release_type=release_type,
         release_type_name=rt_name,
         genres=map_genres(cfg, raw_tags),
         media=(torrent.get("media") or "").strip(),
         remastered=bool(torrent.get("remastered")),
         remaster_year=int(torrent.get("remasterYear") or 0),
-        remaster_title=(torrent.get("remasterTitle") or "").strip(),
-        remaster_label=(torrent.get("remasterRecordLabel") or "").strip(),
+        remaster_title=decode_entities((torrent.get("remasterTitle") or "").strip()),
+        remaster_label=decode_entities((torrent.get("remasterRecordLabel") or "").strip()),
         wiki_image=group.get("wikiImage") or None,
+        proxy_image=group.get("proxyImage") or None,
         raw_tags=list(raw_tags),
     )
 
@@ -1175,6 +1508,10 @@ class AlbumPlan:
     source_dir: str
     matched: bool
     warnings: list[str] = field(default_factory=list)
+    # Name of the tracker profile this album was resolved against. Carried into
+    # the plan so the apply phase attaches the correct session cookie and Referer
+    # when fetching tracker-hosted artwork.
+    tracker_name: str = ""
     album: str = ""
     year: int = 0
     album_artist: str = ""
@@ -1205,7 +1542,7 @@ class AlbumPlan:
     extra_files: list[AuxMove] = field(default_factory=list)
 
 
-def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
+def build_plan_for_dir(cfg: Config, pool: TrackerPool, index: TorrentIndex,
                        source_dir: Path) -> AlbumPlan:
     plan = AlbumPlan(source_dir=str(source_dir), matched=False)
     log(f"processing: {source_dir.name}")
@@ -1217,6 +1554,13 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
         plan.warnings.append("no matching torrent found for directory name")
         return plan
     log(f"  matched torrent [{result.method}]: {ref.name}")
+    tracker = pool.for_ref(ref)
+    if tracker is None:
+        ident = f"source={ref.source or '?'}, announce={ref.announce_host or '?'}"
+        log(f"  no configured tracker for torrent ({ident})")
+        plan.warnings.append(f"no configured tracker matches this torrent ({ident})")
+        return plan
+    plan.tracker_name = tracker.name
     lookup = f"id={ref.torrent_id}" if ref.torrent_id is not None else f"infohash {ref.infohash[:12]}"
     log(f"  querying tracker ({lookup})")
     try:
@@ -1339,7 +1683,7 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
             # Adjudicate the provisional local cover against the remote
             # candidate. The remote supersedes only when it meets the pixel
             # gate; otherwise the local image is retained despite its size.
-            data = fetch_url_bytes(tracker.session, url, cfg.request_timeout)
+            data = tracker.fetch_image(url, meta.proxy_image)
             dims = image_dimensions_bytes(data) if data else None
             remote_qualifies = dims is not None and min(dims) >= cfg.min_cover_px
             if data and remote_qualifies:
@@ -1367,6 +1711,14 @@ def build_plan_for_dir(cfg: Config, tracker: Tracker, index: TorrentIndex,
             plan.cover_url = url
             plan.cover_dest = str(album_dir / cfg.cover_filename)
             cover_chosen = True
+            # The "proxy" scheme's rehost URL expires within seconds, so the
+            # bytes are captured at plan time. The persistent origin (wiki_image)
+            # is retained as cover_url for provenance; other schemes defer the
+            # fetch to the apply phase.
+            if tracker.img_auth == "proxy":
+                plan.cover_data = tracker.fetch_image(url, meta.proxy_image)
+                if plan.cover_data is None:
+                    plan.warnings.append("proxy cover unavailable (no proxyImage)")
             log("  cover: fetched from tracker/itunes")
         elif provisional_local is not None:
             # No remote candidate resolved; the provisional local cover stands.
@@ -1509,12 +1861,34 @@ def load_plan(path: Path) -> list[AlbumPlan]:
 # Apply
 # --------------------------------------------------------------------------- #
 
-def apply_plan(cfg: Config, plans: list[AlbumPlan], tracker: Optional[Tracker],
+def apply_plan(cfg: Config, plans: list[AlbumPlan], pool: Optional[TrackerPool],
                dry_run: bool = False) -> None:
-    session = tracker.session if tracker is not None else requests.Session()
+    fallback_session = requests.Session()
     for plan in plans:
         if not plan.matched:
             continue
+        # Artwork on the tracker host requires that tracker's session cookie and
+        # Referer. The client is resolved by the plan's recorded tracker name;
+        # a plan lacking artwork, or referencing an unconfigured tracker, falls
+        # back to a plain session with no added headers.
+        tracker = None
+        if plan.tracker_name and pool is not None and (plan.cover_url or plan.artist_image_url):
+            try:
+                tracker = pool.by_name(plan.tracker_name)
+            except SystemExit:
+                tracker = None
+                plan.warnings.append(
+                    f"tracker '{plan.tracker_name}' unavailable; artwork fetched without session")
+        session = tracker.session if tracker is not None else fallback_session
+
+        def _get_image(u: Optional[str]) -> Optional[bytes]:
+            # Apply-time artwork retrieval through the sanctioned path. The
+            # "proxy" scheme's proxyImage is not persisted (it would have
+            # expired), so proxy-scheme covers rely on the bytes captured at plan
+            # time; when those are absent the image is left unfetched.
+            if tracker is not None:
+                return tracker.fetch_image(u)
+            return fetch_url_bytes(session, u, cfg.request_timeout) if u else None
         album_dir = Path(plan.album_dir)
         if not dry_run:
             album_dir.mkdir(parents=True, exist_ok=True)
@@ -1546,8 +1920,7 @@ def apply_plan(cfg: Config, plans: list[AlbumPlan], tracker: Optional[Tracker],
         elif plan.cover_url and plan.cover_dest:
             print(f"cover (remote) -> {plan.cover_dest}")
             if not dry_run:
-                data = plan.cover_data or fetch_url_bytes(
-                    session, plan.cover_url, cfg.request_timeout)
+                data = plan.cover_data or _get_image(plan.cover_url)
                 if data:
                     _save_image(data, Path(plan.cover_dest), cfg.max_art_px)
 
@@ -1573,7 +1946,7 @@ def apply_plan(cfg: Config, plans: list[AlbumPlan], tracker: Optional[Tracker],
         if plan.artist_image_url and plan.artist_image_dest:
             print(f"artist image -> {plan.artist_image_dest}")
             if not dry_run:
-                data = fetch_url_bytes(session, plan.artist_image_url, cfg.request_timeout)
+                data = _get_image(plan.artist_image_url)
                 if data:
                     _save_image(data, Path(plan.artist_image_dest), cfg.max_art_px)
 
@@ -1637,29 +2010,39 @@ def _iter_source_dirs(paths: list[str], skip_names: frozenset[str] = frozenset()
     return out
 
 
-def _plan_dirs(cfg: Config, dirs: list[str]) -> tuple[Tracker, list[AlbumPlan]]:
+def _build_pool(cfg: Config) -> TrackerPool:
+    return TrackerPool(cfg, TrackerRegistry(cfg.trackers))
+
+
+def _plan_dirs(cfg: Config, dirs: list[str]) -> tuple[TrackerPool, list[AlbumPlan]]:
     # An empty argument list expands to the immediate subdirectories of the
     # current working directory, treating each as a candidate album source.
     # _iter_source_dirs subsequently filters auxiliary and hidden directories.
     if not dirs:
         dirs = sorted(str(p) for p in Path(".").iterdir() if p.is_dir())
-    tracker = Tracker(cfg)
-    log(tracker.verify())
-    torrent_dir = Path(cfg.torrent_dir).expanduser()
-    log(f"scanning torrents: {torrent_dir}")
-    index = build_torrent_index(torrent_dir)
-    log(f"indexed {len(index.refs)} torrents")
+    pool = _build_pool(cfg)
+    # Individual tracker clients are created and verified lazily on first use, so
+    # a run touching a single tracker does not authenticate against the others.
+    index = TorrentIndex()
+    for td in _torrent_dirs(cfg):
+        if not td.exists():
+            log(f"warning: torrent_dir not found: {td}")
+            continue
+        log(f"scanning torrents: {td}")
+        log(f"  indexed {scan_torrents_into(index, td)} torrents")
+    log(f"indexed {len(index.refs)} torrents total")
     source_dirs = _iter_source_dirs(dirs, frozenset({cfg.extra_files_dirname}))
     log(f"processing {len(source_dirs)} source directories")
-    plans = [build_plan_for_dir(cfg, tracker, index, d) for d in source_dirs]
+    plans = [build_plan_for_dir(cfg, pool, index, d) for d in source_dirs]
     matched = sum(1 for p in plans if p.matched)
     log(f"done: {matched}/{len(plans)} matched")
-    return tracker, plans
+    return pool, plans
 
 
 def cmd_auth(cfg: Config, args) -> int:
-    """Validate the configured API key without touching the library."""
-    print(Tracker(cfg).verify())
+    """Validate every configured tracker's API key without touching the library."""
+    for profile in cfg.trackers:
+        print(Tracker(profile, cfg).verify())
     return 0
 
 
@@ -1673,18 +2056,13 @@ def cmd_plan(cfg: Config, args) -> int:
 
 def cmd_apply(cfg: Config, args) -> int:
     plans = load_plan(Path(args.plan))
-    tracker = None
-    if any(p.cover_url or p.artist_image_url for p in plans):
-        try:
-            tracker = Tracker(cfg)
-        except SystemExit:
-            tracker = None
-    apply_plan(cfg, plans, tracker, dry_run=args.dry_run)
+    pool = _build_pool(cfg) if any(p.cover_url or p.artist_image_url for p in plans) else None
+    apply_plan(cfg, plans, pool, dry_run=args.dry_run)
     return 0
 
 
 def cmd_run(cfg: Config, args) -> int:
-    tracker, plans = _plan_dirs(cfg, args.dirs)
+    pool, plans = _plan_dirs(cfg, args.dirs)
     print_report(plans)
     plan_path = Path(args.plan)
     write_plan(plans, plan_path)
@@ -1692,7 +2070,7 @@ def cmd_run(cfg: Config, args) -> int:
     while True:
         choice = input("[a]pply  [e]dit plan  [q]uit > ").strip().lower()
         if choice in ("a", "apply"):
-            apply_plan(cfg, load_plan(plan_path), tracker, dry_run=args.dry_run)
+            apply_plan(cfg, load_plan(plan_path), pool, dry_run=args.dry_run)
             return 0
         if choice in ("e", "edit"):
             os.system(f'{os.environ.get("EDITOR", "nano")} "{plan_path}"')

@@ -1,16 +1,12 @@
 # gaztag configuration. Copy to ~/.config/gaztag/config.toml and edit.
-# The tracker token and base URL are read from the environment when present
-# (RED_API_TOKEN, RED_BASE_URL), which take precedence over the values below.
-
-# Tracker origin, no trailing slash. Example: "https://tracker.example"
-base_url = ""
-# API token (Authorization header value). Prefer the RED_API_TOKEN environment
-# variable over storing the token in a file.
-api_token = ""
-
-# Directory Transmission writes ".torrent" / ".torrent.added" files into. The
-# content name of each torrent is matched against source directory names.
-torrent_dir = ""
+#
+# --- Torrents ----------------------------------------------------------------
+#  Directory / directories where .torrent(.added) files are stored. 
+#  These are what's used to match the processed files with the tracker source. 
+#  Built based on Transmission's handling of auto-added torrent files.
+#   torrent_dir = "~/dl/watch"
+#   torrent_dir = ["~/dl/red", "~/dl/ops"]
+torrent_dir = "Torrent Files"
 
 # Destination root for the organized tree. Empty organizes in place, beside the
 # source directory. May be overridden per-invocation with --dest.
@@ -21,34 +17,19 @@ dest_root = ""
 dsd_subdir = "00 DSD"
 
 # --- Rate limiting -----------------------------------------------------------
-requests_per_window = 10
+# Global defaults, applied to any tracker that does not set its own. A limit of
+#  5 requests in 10 seconds will keep both trackers happy.
+requests_per_window = 5
 window_seconds = 10.0
 request_timeout = 30.0
 
 # --- Genre -------------------------------------------------------------------
-# Mapped genres are joined into a single tag value using genre_join. Set
-# genre_join to a TOML null (omit / leave commented) to write separate values.
+# Mapped genres are joined into a single tag value using genre_join. Comment
+#  out to write separate values.
 genre_join = "; "
 max_genres = 3
 
-# Tracker tag -> display genre. Unlisted tags are Title-Cased with separators
-# converted to spaces. Compound genres that require hyphens or ampersands are
-# listed explicitly.
-[genre_map]
-"singer.songwriter" = "Singer-Songwriter"
-"drum.and.bass" = "Drum & Bass"
-"hip.hop" = "Hip-Hop"
-"trip.hop" = "Trip-Hop"
-"post.rock" = "Post-Rock"
-"post.punk" = "Post-Punk"
-"synth.pop" = "Synth-Pop"
-"dream.pop" = "Dream Pop"
-"nu.disco" = "Nu-Disco"
-"lo.fi" = "Lo-Fi"
-"jazz.fusion" = "Jazz Fusion"
-"rnb" = "R&B"
-
-# Tracker tags never emitted as genres.
+# Tracker tags are not genres
 genre_blocklist = [
     "staff.picks", "vanity.house", "seen.live",
     "producer", "composer", "vocalist", "guitarist",
@@ -59,21 +40,19 @@ genre_blocklist = [
 # credited: 3 = Soundtrack, 7 = Compilation.
 va_release_types = [3, 7]
 various_artists_label = "Various Artists"
-artist_join = ", "
+artist_join = "; "
 
 # --- Naming ------------------------------------------------------------------
 # file_template fields: {pos} {title} {disc} {track} {ext}
-#   pos is disc*100 + track on multi-disc releases (101, 201, ...), otherwise a
-#   two-digit track number.
+#   pos is disc*100 + track on multi-disc releases (101, 201, ...).
 file_template = "{pos} - {title}{ext}"
 
 # album_dir_template fields: {year} {album} {sort_title} {album_artist}
 #   {label} {catno} {sample_rate} {release_type} {version}
-# Empty fields collapse cleanly (stray "[]" / "()" are removed).
+# Empty values are dropped.
 album_dir_template = "({year}) {album} [{sample_rate}]"
 
-# Leading articles to strip for {sort_title}. Left empty so album and directory
-# names remain literal; the library frontend performs article-insensitive sort.
+# Leading articles to strip for {sort_title}. If you're into that kind of thing. 
 sort_articles = []
 
 # DSD sample-rate unit in directory names: "MHz" -> "2.8224 MHz",
@@ -91,7 +70,7 @@ write_date = true
 # value is never blanked.
 write_releasetype = true
 write_albumversion = true
-write_label = false
+write_label = true
 write_catalognumber = false
 # A plain WEB/PCM original with no remaster receives a blank albumversion.
 albumversion_blank_plain = true
@@ -105,3 +84,87 @@ max_art_px = 2000
 # Order of cover sources. "tracker" uses the group wiki image; "itunes" queries
 # the iTunes Search API by "album artist + album".
 cover_sources = ["tracker", "itunes"]
+
+# --- Genre map ---------------------------------------------------------------
+# Tracker tag -> display genre. Unlisted tags are Title-Cased with separators
+# converted to spaces. Compound genres that require hyphens or ampersands are
+# listed explicitly. This table is placed last; no bare top-level key may follow
+# it.
+[genre_map]
+"singer.songwriter" = "Singer-Songwriter"
+"drum.and.bass" = "Drum & Bass"
+"hip.hop" = "Hip-Hop"
+"trip.hop" = "Trip-Hop"
+"post.rock" = "Post-Rock"
+"post.punk" = "Post-Punk"
+"synth.pop" = "Synth-Pop"
+"dream.pop" = "Dream Pop"
+"nu.disco" = "Nu-Disco"
+"lo.fi" = "Lo-Fi"
+"jazz.fusion" = "Jazz Fusion"
+"rnb" = "R&B"
+
+# --- Trackers ----------------------------------------------------------------
+# One [[tracker]] table per tracker. Each ".torrent" file is attributed to a
+# tracker by its cross-seed marker. , falling back to the announce hostname. 
+#
+# Per-tracker keys:
+#   name                 label used in logs and in the plan; defaults to the
+#                        base_url host.
+#
+#   base_url             site origin, no trailing slash.
+#   api_token            API token (sent as the Authorization header).
+#
+#   source               cross-seed tags are set for RED and OPS. If you're cool
+#                               enough to be on more than 2 trackers, you'll have to find
+#                               additional values.  If your torrent client doesn't show this tag,
+#                           open a .torrent file in a text editor.  It  should be the very last thing 
+#                               in the file.  Ex: REDee (drop the ee)
+#
+#   announce_hosts       announce hostname(s); string or list. Used when a
+#                        torrent carries no source tag.
+#
+#   requests_per_window,
+#   window_seconds,
+#   request_timeout      optional per-tracker rate limit / timeout; each falls
+#                        back to the global default above when omitted.
+#   img_auth             image-host authorization scheme:
+#                          "none"    fetch image URLs directly (default), for
+#                                    public / third-party art hosts.
+#                          "imgauth" obtain a {h,e,u} credential from
+#                                    ajax.php?action=imgauth and append it to
+#                                    image URLs on img_host, cached until expiry
+#                                    (e.g. RED, which rehosts art on its own
+#                                    host behind a token gate). If the credential
+#                                    cannot be obtained the image is left
+#                                    unfetched; no unauthorized request is made.
+#                          "proxy"   use only the official, short-lived
+#                                    "proxyImage" URL the API returns (e.g. OPS),
+#                                    fetched at plan time. Use "none" instead when
+#                                    the origin art host is public.
+#                        Each scheme uses one sanctioned source and fails closed;
+#                        no scheme falls back to an alternative source.
+#   img_host             host that img_auth applies to; defaults to base_url host.
+#
+# The first tracker's base_url / api_token are still overridden by the
+# RED_BASE_URL / RED_API_TOKEN environment variables when those are set.
+
+[[tracker]]
+name = "RED"
+base_url = "https://redacted.sh"
+api_token = ""
+source = "RED"
+announce_hosts = ["flacsfor.me"]
+img_auth = "imgauth"
+# img_host defaults to redacted.sh here; set it only if art is served elsewhere.
+
+[[tracker]]
+name = "OPS"
+base_url = "https://orpheus.network"
+api_token = ""
+source = "OPS"
+announce_hosts = ["home.opsfet.ch"]
+# OPS album covers are publicly hosted, so direct fetch is possible, but
+# in the interest of following the API documentation, image proxy is default.
+# This can be changed to "none" if you have issues.
+img_auth = "proxy"
